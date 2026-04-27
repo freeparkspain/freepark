@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "FreePark",
+    "slug": "freepark",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#3B82F6"
+    },
+
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.freepark.app"
+    },
+
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#3B82F6"
+      },
+      "package": "com.freepark.app"
+    },
+
+    "web": {
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}

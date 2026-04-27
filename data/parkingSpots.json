@@ -1,0 +1,167 @@
+[
+  {
+    "id": "1",
+    "name": "Calle Larios Street Parking",
+    "latitude": 36.7223,
+    "longitude": -4.4214,
+    "type": "free",
+    "description": "Free street parking near the iconic Calle Larios pedestrian zone. Disk required on weekdays.",
+    "address": "Calle Larios, Málaga Centro",
+    "maxHours": 2,
+    "notes": "Free on weekends and public holidays"
+  },
+  {
+    "id": "2",
+    "name": "Parking Alcazaba",
+    "latitude": 36.7213,
+    "longitude": -4.4179,
+    "type": "paid",
+    "description": "Underground paid parking directly beneath the Alcazaba fortress. Open 24/7.",
+    "address": "Calle Alcazabilla, Málaga",
+    "maxHours": null,
+    "notes": "€1.50/hour, €12 daily max"
+  },
+  {
+    "id": "3",
+    "name": "Paseo del Parque",
+    "latitude": 36.7195,
+    "longitude": -4.4158,
+    "type": "free",
+    "description": "Open street parking along the famous Paseo del Parque boulevard.",
+    "address": "Paseo del Parque, Málaga",
+    "maxHours": null,
+    "notes": "Free but limited availability near the Cathedral"
+  },
+  {
+    "id": "4",
+    "name": "Playa La Malagueta",
+    "latitude": 36.7165,
+    "longitude": -4.4083,
+    "type": "free",
+    "description": "Large free parking area near La Malagueta beach. Very popular on summer weekends.",
+    "address": "Paseo de Reding, Málaga",
+    "maxHours": null,
+    "notes": "Free, gets busy June–September"
+  },
+  {
+    "id": "5",
+    "name": "Parking El Corte Inglés",
+    "latitude": 36.7199,
+    "longitude": -4.4330,
+    "type": "paid",
+    "description": "Paid underground parking at El Corte Inglés. Free first hour with any purchase.",
+    "address": "Avda. de Andalucía, Málaga",
+    "maxHours": null,
+    "notes": "€1.80/hour, 1h free with purchase"
+  },
+  {
+    "id": "6",
+    "name": "Soho Arts District",
+    "latitude": 36.7171,
+    "longitude": -4.4296,
+    "type": "free",
+    "description": "Street parking in Málaga's Soho arts district. Blue zone, parking disk required.",
+    "address": "Calle Casas de Campos, Soho, Málaga",
+    "maxHours": 2,
+    "notes": "Blue zone disk available at tourist offices"
+  },
+  {
+    "id": "7",
+    "name": "Puerto de Málaga – Muelle Uno",
+    "latitude": 36.7157,
+    "longitude": -4.4226,
+    "type": "paid",
+    "description": "Port area paid parking, convenient for cruise passengers and Muelle Uno restaurants.",
+    "address": "Muelle Uno, Puerto de Málaga",
+    "maxHours": null,
+    "notes": "€1.20/hour"
+  },
+  {
+    "id": "8",
+    "name": "Pedregalejo Residential",
+    "latitude": 36.7143,
+    "longitude": -4.3780,
+    "type": "free",
+    "description": "Residential street parking in the charming Pedregalejo fishing neighborhood.",
+    "address": "Calle Bolivia, Pedregalejo, Málaga",
+    "maxHours": null,
+    "notes": "Residents priority, usually available from 9 pm"
+  },
+  {
+    "id": "9",
+    "name": "El Palo Beach Parking",
+    "latitude": 36.7140,
+    "longitude": -4.3640,
+    "type": "free",
+    "description": "Free open parking near El Palo beach. Popular with local families.",
+    "address": "Avenida Salvador Allende, El Palo, Málaga",
+    "maxHours": null,
+    "notes": "Popular on weekends, arrive early in summer"
+  },
+  {
+    "id": "10",
+    "name": "Campus Universitario Teatinos",
+    "latitude": 36.7180,
+    "longitude": -4.4780,
+    "type": "free",
+    "description": "Large free parking area near the University of Málaga campus.",
+    "address": "Campus Universitario Teatinos, Málaga",
+    "maxHours": null,
+    "notes": "Free, plenty of space year-round"
+  },
+  {
+    "id": "11",
+    "name": "Carrefour Málaga",
+    "latitude": 36.7095,
+    "longitude": -4.4920,
+    "type": "free",
+    "description": "Free customer parking at Carrefour hypermarket. Requires in-store ticket validation.",
+    "address": "Avda. Juan XXIII, Málaga",
+    "maxHours": 3,
+    "notes": "Free 3h with store ticket, €1/h after"
+  },
+  {
+    "id": "12",
+    "name": "Parking Plaza Mayor",
+    "latitude": 36.7020,
+    "longitude": -4.4760,
+    "type": "paid",
+    "description": "Large paid parking at Plaza Mayor shopping and leisure centre.",
+    "address": "Avda. de Velázquez, Málaga",
+    "maxHours": null,
+    "notes": "First 2 hours free with purchase, €1.50/h after"
+  },
+  {
+    "id": "13",
+    "name": "Estación de Autobuses",
+    "latitude": 36.7130,
+    "longitude": -4.4406,
+    "type": "paid",
+    "description": "Paid parking adjacent to the main Málaga bus station.",
+    "address": "Paseo de los Tilos, Málaga",
+    "maxHours": null,
+    "notes": "€1.00/hour, affordable long-stay rates"
+  },
+  {
+    "id": "14",
+    "name": "Avenida Andalucía – Variable Zone",
+    "latitude": 36.7175,
+    "longitude": -4.4410,
+    "type": "unknown",
+    "description": "Parking rules vary by block along this avenue. Always check local signage before parking.",
+    "address": "Avda. de Andalucía, Málaga",
+    "maxHours": null,
+    "notes": "Some blocks free, some ORA zone — verify on-site"
+  },
+  {
+    "id": "15",
+    "name": "Barrio Lagunillas",
+    "latitude": 36.7255,
+    "longitude": -4.4145,
+    "type": "unknown",
+    "description": "This residential zone is being redeveloped. Parking status unclear — verify on-site.",
+    "address": "Barrio de Lagunillas, Málaga",
+    "maxHours": null,
+    "notes": "Check local signage — regulations may have changed"
+  }
+]
