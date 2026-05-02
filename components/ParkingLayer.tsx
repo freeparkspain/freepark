@@ -6,10 +6,50 @@ import { useClustering, ClusterItem } from '../hooks/useClustering';
 import { ParkingMarker } from './ParkingMarker';
 
 // ─── Geometry styles ──────────────────────────────────────────────────────────
-// Mapy.com spec: fill = rgba(0, 122, 255, 0.3)
 
 const POLY = { fill: 'rgba(0,122,255,0.30)', stroke: '#007AFF', width: 2.5 };
 const LINE = { color: '#007AFF', width: 8 };
+
+// ─── SelectedGeometryLayer ────────────────────────────────────────────────────
+// Isolated into its own memo'd component so that polygon load / unload events
+// (which change `polygon` / `polyline` frequently) never trigger a reconcile
+// of the markers loop below.  The two subtrees are now fully decoupled.
+
+interface GeometryLayerProps {
+  selectedParkingId: string | null;
+  polygon:           LatLng[] | null;
+  polyline:          LatLng[] | null;
+}
+
+const SelectedGeometryLayer = memo(({
+  selectedParkingId,
+  polygon,
+  polyline,
+}: GeometryLayerProps) => (
+  <>
+    {polygon && selectedParkingId && (
+      <Polygon
+        key={`poly-${selectedParkingId}`}
+        coordinates={polygon}
+        fillColor={POLY.fill}
+        strokeColor={POLY.stroke}
+        strokeWidth={POLY.width}
+        zIndex={2}
+      />
+    )}
+    {polyline && !polygon && selectedParkingId && (
+      <Polyline
+        key={`line-${selectedParkingId}`}
+        coordinates={polyline}
+        strokeColor={LINE.color}
+        strokeWidth={LINE.width}
+        lineCap="round"
+        lineJoin="round"
+        zIndex={2}
+      />
+    )}
+  </>
+));
 
 // ─── Cluster marker ───────────────────────────────────────────────────────────
 
@@ -28,6 +68,7 @@ const ClusterMarker = memo(({ item, onPress }: {
     <Marker
       coordinate={item.position}
       tracksViewChanges={false}
+      calloutEnabled={false}
       anchor={{ x: 0.5, y: 0.5 }}
       onPress={() => onPress(item.position)}
     >
@@ -47,21 +88,20 @@ const ClusterMarker = memo(({ item, onPress }: {
 // ─── ParkingLayer ─────────────────────────────────────────────────────────────
 
 interface Props {
-  parkings:         OsmParking[];
-  selectedParking:  OsmParking | null;
-  latitudeDelta:    number;
-  viewportBounds:   BBox;
-  onPressMarker:    (parking: OsmParking) => void;
-  onPressCluster:   (position: LatLng) => void;
-  // Lazily-loaded geometry for the selected parking (null while loading or for nodes)
-  selectedPolygon:  LatLng[] | null;
-  selectedPolyline: LatLng[] | null;
-  geometryLoading:  boolean;
+  parkings:          OsmParking[];
+  selectedParkingId: string | null;
+  latitudeDelta:     number;
+  viewportBounds:    BBox;
+  onPressMarker:     (parking: OsmParking) => void;
+  onPressCluster:    (position: LatLng) => void;
+  selectedPolygon:   LatLng[] | null;
+  selectedPolyline:  LatLng[] | null;
+  geometryLoading:   boolean;
 }
 
 export const ParkingLayer = memo(({
   parkings,
-  selectedParking,
+  selectedParkingId,
   latitudeDelta,
   viewportBounds,
   onPressMarker,
@@ -72,41 +112,19 @@ export const ParkingLayer = memo(({
 }: Props) => {
 
   const clusterItems = useClustering(parkings, latitudeDelta, viewportBounds);
-  const selectedId   = selectedParking?.id ?? null;
 
   return (
     <>
       {/*
-       * ── Lazily-loaded geometry (Mapy.com effect) ──────────────────────────
-       *
-       * Geometry arrives via a dedicated second request fired on tap, not from
-       * the main markers fetch. selectedPolygon / selectedPolyline come from
-       * useGeometryLoader in MapScreen and are null until that request resolves.
-       *
-       * While loading: the selected ParkingMarker shows a spinner (below).
-       * Once loaded:   the overlay appears and the spinner reverts to 'P'.
+       * Geometry is isolated in its own subtree.  When a polygon loads or
+       * clears, only SelectedGeometryLayer re-renders — the markers loop below
+       * is completely unaffected.
        */}
-      {selectedPolygon && selectedParking && (
-        <Polygon
-          key={`poly-${selectedParking.id}`}
-          coordinates={selectedPolygon}
-          fillColor={POLY.fill}
-          strokeColor={POLY.stroke}
-          strokeWidth={POLY.width}
-          zIndex={2}
-        />
-      )}
-      {selectedPolyline && !selectedPolygon && selectedParking && (
-        <Polyline
-          key={`line-${selectedParking.id}`}
-          coordinates={selectedPolyline}
-          strokeColor={LINE.color}
-          strokeWidth={LINE.width}
-          lineCap="round"
-          lineJoin="round"
-          zIndex={2}
-        />
-      )}
+      <SelectedGeometryLayer
+        selectedParkingId={selectedParkingId}
+        polygon={selectedPolygon}
+        polyline={selectedPolyline}
+      />
 
       {/* ── Markers / clusters ──────────────────────────────────────────────── */}
       {clusterItems.map(item =>
@@ -116,8 +134,8 @@ export const ParkingLayer = memo(({
           <ParkingMarker
             key={item.data.id}
             parking={item.data}
-            isSelected={item.data.id === selectedId}
-            isLoadingGeometry={item.data.id === selectedId && geometryLoading}
+            isSelected={item.data.id === selectedParkingId}
+            isLoadingGeometry={item.data.id === selectedParkingId && geometryLoading}
             onPress={onPressMarker}
           />
         ),

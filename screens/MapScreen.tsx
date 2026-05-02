@@ -7,8 +7,9 @@ import { OsmParking, LatLng, BBox, RouteInfo } from '../types/parking';
 import { useMapParkings } from '../hooks/useMapParkings';
 import { useGeometryLoader } from '../hooks/useGeometryLoader';
 import { ParkingLayer } from '../components/ParkingLayer';
-import { LoadingOverlay } from '../components/LoadingOverlay';
-import { RouteBottomSheet } from '../components/RouteBottomSheet';
+import { LoadingOverlay }      from '../components/LoadingOverlay';
+import { GeometryLoadingBar }  from '../components/GeometryLoadingBar';
+import { RouteBottomSheet }    from '../components/RouteBottomSheet';
 import { MAPS_APIKEY } from '../constants/maps';
 
 export const MALAGA_REGION: Region = {
@@ -28,7 +29,15 @@ function regionToBBox(r: Region): BBox {
 }
 
 export const MapScreen: React.FC = () => {
-  const mapRef = useRef<MapView>(null);
+  const mapRef               = useRef<MapView>(null);
+  const regionDebounceTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Guard: Marker.onPress and MapView.onPress both fire for the same physical tap
+  // on iOS (UITapGestureRecognizer runs alongside MKAnnotationView selection).
+  // We set this flag inside handlePressMarker so the map-press handler can bail.
+  const markerJustTappedRef  = useRef(false);
+  // Interaction lock: prevents multiple rapid taps on different markers from
+  // queuing up simultaneous state updates and geometry fetches.
+  const isProcessingRef      = useRef(false);
 
   // ── Step 1: fast markers (out center — centroid only, no geometry) ────────
   const { parkings, loading, loadForRegion } = useMapParkings();
@@ -41,7 +50,9 @@ export const MapScreen: React.FC = () => {
   const [viewportBounds, setViewportBounds] = useState<BBox>(() => regionToBBox(MALAGA_REGION));
 
   // Selected parking — drives geometry fetch + bottom sheet
-  const [selectedParking, setSelectedParking] = useState<OsmParking | null>(null);
+  const [selectedParking,   setSelectedParking]   = useState<OsmParking | null>(null);
+  // ID-only selection state — sole gate for polygon/polyline rendering
+  const [selectedParkingId, setSelectedParkingId] = useState<string | null>(null);
 
   // Navigation
   const [activeRoute, setActiveRoute] = useState(false);
@@ -72,18 +83,44 @@ export const MapScreen: React.FC = () => {
     loadForRegion(MALAGA_REGION);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Clean up debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
+    };
+  }, []);
+
   // ── Map event handlers ────────────────────────────────────────────────────
+  // Debounce the entire handler so rapid onRegionChangeComplete bursts (e.g.
+  // back-to-back programmatic animations) collapse into a single state update
+  // and a single API-trigger — prevents Supercluster rebuilds and API spam.
   const handleRegionChangeComplete = useCallback((region: Region) => {
-    setLatDelta(region.latitudeDelta);
-    setViewportBounds(regionToBBox(region));
-    loadForRegion(region);
+    if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
+    regionDebounceTimer.current = setTimeout(() => {
+      setLatDelta(region.latitudeDelta);
+      setViewportBounds(regionToBBox(region));
+      loadForRegion(region);
+    }, 500);
   }, [loadForRegion]);
 
   const handlePressMarker = useCallback((parking: OsmParking) => {
+    // Drop fast-tap repeats — if a state update + geometry fetch is already
+    // in flight, ignore the new tap.  The lock releases after 300 ms which is
+    // enough for React to flush the first batch and for the native map to
+    // visually confirm the selection.
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+    setTimeout(() => { isProcessingRef.current = false; }, 300);
+
+    // Raise the flag so handleMapPress (which fires immediately after on iOS)
+    // knows this touch was on a marker and should not deselect.
+    markerJustTappedRef.current = true;
+    requestAnimationFrame(() => { markerJustTappedRef.current = false; });
+
     setSelectedParking(parking);
+    setSelectedParkingId(parking.id);
     setActiveRoute(false);
     setRouteInfo(null);
-    // Kick off the geometry fetch for this parking immediately on tap
     loadGeometry(parking);
   }, [loadGeometry]);
 
@@ -112,11 +149,24 @@ export const MapScreen: React.FC = () => {
     setRouteInfo(null);
   }, []);
 
+  // Called by the bottom-sheet close button — always deselects.
   const handleCloseSheet = useCallback(() => {
     setSelectedParking(null);
+    setSelectedParkingId(null);
     setActiveRoute(false);
     setRouteInfo(null);
-    // Cancel any in-flight geometry fetch and clear the rendered overlay
+    clearGeometry();
+  }, [clearGeometry]);
+
+  // Called by MapView.onPress (empty-map tap) — deselects ONLY when the tap
+  // was not on a marker.  Without this guard, Marker.onPress + MapView.onPress
+  // both fire for the same touch on iOS, causing an instant open-then-close.
+  const handleMapPress = useCallback(() => {
+    if (markerJustTappedRef.current) return;
+    setSelectedParking(null);
+    setSelectedParkingId(null);
+    setActiveRoute(false);
+    setRouteInfo(null);
     clearGeometry();
   }, [clearGeometry]);
 
@@ -135,6 +185,7 @@ export const MapScreen: React.FC = () => {
         showsUserLocation
         showsMyLocationButton={false}
         onRegionChangeComplete={handleRegionChangeComplete}
+        onPress={handleMapPress}
       >
         <UrlTile
           urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -158,7 +209,7 @@ export const MapScreen: React.FC = () => {
 
         <ParkingLayer
           parkings={parkings}
-          selectedParking={selectedParking}
+          selectedParkingId={selectedParkingId}
           latitudeDelta={latDelta}
           viewportBounds={viewportBounds}
           onPressMarker={handlePressMarker}
@@ -168,6 +219,10 @@ export const MapScreen: React.FC = () => {
           geometryLoading={geometryLoading}
         />
       </MapView>
+
+      {/* Thin sliding bar at top — geometry fetch OR main fetch (mirror rotation
+          can take several seconds; give the user visible progress for both) */}
+      <GeometryLoadingBar visible={geometryLoading || loading} />
 
       {/* Spinner below status bar — visible during the main markers fetch */}
       <LoadingOverlay visible={loading} />

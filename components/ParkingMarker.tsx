@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useEffect, useState } from 'react';
 import { View, Text, ActivityIndicator, StyleSheet, Platform } from 'react-native';
 import { Marker } from 'react-native-maps';
 import { OsmParking } from '../types/parking';
@@ -10,33 +10,68 @@ interface Props {
   onPress:           (parking: OsmParking) => void;
 }
 
-export const ParkingMarker = memo(({
+// ─── Custom comparator ────────────────────────────────────────────────────────
+// The only prop that changes the visible native marker is `isSelected`
+// (controls zIndex so the pin floats to the front).  All other prop changes
+// — new `parking` reference on re-fetch, `isLoadingGeometry` toggling, stable
+// `onPress` callback — are intentionally ignored to keep reconciliation O(1)
+// per selection event instead of O(n) across the entire visible set.
+// `isLoadingGeometry`-driven UI feedback is handled by GeometryLoadingBar.
+function arePropsEqual(prev: Props, next: Props): boolean {
+  return (
+    prev.isSelected  === next.isSelected &&
+    prev.parking.id  === next.parking.id
+  );
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+function ParkingMarkerBase({
   parking, isSelected, isLoadingGeometry, onPress,
-}: Props) => (
-  <Marker
-    coordinate={parking.position}
-    // tracksViewChanges must be true while the content is changing (spinner→P)
-    // to let the native layer re-render; false otherwise for 60 fps scrolling
-    tracksViewChanges={isLoadingGeometry}
-    anchor={{ x: 0.5, y: 0.5 }}
-    zIndex={isSelected ? 10 : 1}
-    onPress={() => onPress(parking)}
-  >
-    <View
-      style={[styles.pin, isSelected && styles.pinSelected]}
-      renderToHardwareTextureAndroid={Platform.OS === 'android'}
-      // @ts-ignore — shouldRasterizeIOS is valid but not typed in RN defs
-      shouldRasterizeIOS={!isLoadingGeometry && Platform.OS === 'ios'}
-      collapsable={false}
+}: Props) {
+  // ── tracksViewChanges warm-up ─────────────────────────────────────────────
+  // Start true so the native layer commits the initial raster (correct size,
+  // correct icon) before we freeze it.  Without this, some Android devices
+  // rasterise at 0×0 and the marker is invisible or untappable.
+  // After 500 ms the flag drops to false and stays there — the pin becomes a
+  // static GPU bitmap that never causes layout work during pan/zoom.
+  const [tracksViews, setTracksViews] = useState(true);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setTracksViews(false), 500);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <Marker
+      coordinate={parking.position}
+      tracksViewChanges={tracksViews}
+      calloutEnabled={false}
+      anchor={{ x: 0.5, y: 0.5 }}
+      zIndex={isSelected ? 10 : 1}
+      onPress={() => {
+        console.log('[ParkingMarker] tapped:', parking.id);
+        onPress(parking);
+      }}
     >
-      {isLoadingGeometry ? (
-        <ActivityIndicator size="small" color="#ffffff" />
-      ) : (
-        <Text style={[styles.label, isSelected && styles.labelSelected]}>P</Text>
-      )}
-    </View>
-  </Marker>
-));
+      <View
+        style={[styles.pin, isSelected && styles.pinSelected]}
+        renderToHardwareTextureAndroid={Platform.OS === 'android'}
+        // @ts-ignore — shouldRasterizeIOS is valid but not typed in RN defs
+        shouldRasterizeIOS={Platform.OS === 'ios'}
+        collapsable={false}
+      >
+        {isLoadingGeometry ? (
+          <ActivityIndicator size="small" color="#ffffff" />
+        ) : (
+          <Text style={[styles.label, isSelected && styles.labelSelected]}>P</Text>
+        )}
+      </View>
+    </Marker>
+  );
+}
+
+export const ParkingMarker = memo(ParkingMarkerBase, arePropsEqual);
 
 const styles = StyleSheet.create({
   pin: {

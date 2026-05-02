@@ -1,39 +1,91 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Region } from 'react-native-maps';
 import { fetchParkingData } from '../services/overpassService';
-import { OsmParking, LatLng } from '../types/parking';
-import { deltaToZoom, haversineDistance } from '../utils/geo';
+import { OsmParking } from '../types/parking';
+import { deltaToZoom } from '../utils/geo';
 
 export type { OsmParking } from '../types/parking';
 
 // ─── Tuning constants ─────────────────────────────────────────────────────────
 
-const DEBOUNCE_MS      = 1_000;  // quiet time after last move before firing
-const CACHE_PREC       = 3;      // bbox key decimal places (~111 m per unit)
-const MIN_ZOOM         = 12;     // below this zoom Overpass returns too many results
-const MIN_FETCH_DIST_M = 500;    // ignore pans shorter than 500 m …
-const ZOOM_CHANGE_FRAC = 0.20;   // … unless zoom changed by ≥ 20 %
-const COOLDOWN_MS      = 5_000;  // back-off after HTTP 429
+const DEBOUNCE_MS        = 800;   // quiet time after last move before firing
+const MIN_ZOOM           = 14;    // zoom 14 ≈ 0.022° delta (neighbourhood level)
+const COVERAGE_THRESHOLD = 0.40;  // skip network fetch if ≥40% of viewport is
+                                  // already covered by session-fetched rectangles
+const COOLDOWN_MS        = 5_000; // back-off window after HTTP 429
 
-// ─── Module-level persistent caches ──────────────────────────────────────────
-// Declared outside the hook so they survive component re-mounts.
-// If MapScreen unmounts (e.g. navigation push) and comes back, the cache is
-// already warm — no network call needed and markers appear instantly.
+// ─── Persistence ─────────────────────────────────────────────────────────────
 
-/** Bbox keys we have already fetched. Prevents duplicate requests. */
-const fetchedBboxes = new Set<string>();
+/** AsyncStorage key — bump the suffix when the OsmParking shape changes. */
+const STORAGE_KEY = 'freepark_v1_parkings';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type BBox4 = { south: number; west: number; north: number; east: number };
+
+// ─── Module-level session caches ─────────────────────────────────────────────
+// Survive component re-mounts within a single app session.
+
+/** Every viewport rectangle successfully fetched from Overpass this session. */
+const fetchedRects: BBox4[] = [];
 
 /**
- * Every parking ever loaded in this session, keyed by OSM ID.
- * New fetches merge into this map — entries are never removed.
- * This means panning back to a previously visited area shows cached markers
- * immediately, without a spinner or an API call.
+ * Every parking ever loaded (network + storage), keyed by OSM ID.
+ * Entries are never removed — the cache only grows.
  */
 const allParkings = new Map<string, OsmParking>();
 
+/**
+ * Guards the one-time AsyncStorage load so it runs exactly once per JS
+ * process lifetime, even if the hook mounts and unmounts multiple times.
+ */
+let storageLoaded = false;
+
+// ─── Spatial helpers ──────────────────────────────────────────────────────────
+
+function bboxArea(b: BBox4): number {
+  return Math.max(0, b.east - b.west) * Math.max(0, b.north - b.south);
+}
+
+function intersectBbox(a: BBox4, b: BBox4): BBox4 | null {
+  const south = Math.max(a.south, b.south);
+  const west  = Math.max(a.west,  b.west);
+  const north = Math.min(a.north, b.north);
+  const east  = Math.min(a.east,  b.east);
+  return south < north && west < east ? { south, west, north, east } : null;
+}
+
+/**
+ * Fraction of `target` already covered by the union of `rects`.
+ * Sums pairwise intersections (O(n)); caps at 1.0 to absorb double-counting
+ * when fetched rectangles overlap each other.
+ */
+function coveredFraction(target: BBox4, rects: BBox4[]): number {
+  const total = bboxArea(target);
+  if (total <= 0 || rects.length === 0) return 0;
+  let covered = 0;
+  for (const r of rects) {
+    const ix = intersectBbox(target, r);
+    if (ix) covered += bboxArea(ix);
+  }
+  return Math.min(1, covered / total);
+}
+
+/** True if every corner of `target` lies inside at least one fetched rect. */
+function isContainedInAny(target: BBox4, rects: BBox4[]): boolean {
+  return rects.some(
+    r =>
+      target.south >= r.south &&
+      target.west  >= r.west  &&
+      target.north <= r.north &&
+      target.east  <= r.east,
+  );
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function regionToBounds(r: Region) {
+function regionToBBox(r: Region): BBox4 {
   return {
     south: r.latitude  - r.latitudeDelta  / 2,
     west:  r.longitude - r.longitudeDelta / 2,
@@ -42,74 +94,110 @@ function regionToBounds(r: Region) {
   };
 }
 
-function regionToKey(r: Region): string {
-  const { south, west, north, east } = regionToBounds(r);
-  const f = (n: number) => n.toFixed(CACHE_PREC);
-  return `${f(south)},${f(west)},${f(north)},${f(east)}`;
+// ─── Persistence helpers ──────────────────────────────────────────────────────
+
+/** Merge `items` into `allParkings`; returns count of genuinely new entries. */
+function mergeIntoCache(items: OsmParking[]): number {
+  let added = 0;
+  for (const p of items) {
+    if (!allParkings.has(p.id)) {
+      allParkings.set(p.id, p);
+      added++;
+    }
+  }
+  return added;
 }
 
-function regionCenter(r: Region): LatLng {
-  return { latitude: r.latitude, longitude: r.longitude };
+/** Fire-and-forget: persist the current allParkings snapshot to AsyncStorage. */
+function persistCache(): void {
+  AsyncStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(Array.from(allParkings.values())),
+  ).catch(err => console.warn('[useMapParkings] storage write:', err));
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export const useMapParkings = () => {
-  // On re-mount, pre-populate from the persistent cache so the map is never blank
+  // Pre-populate from the in-memory cache on every mount (instant if warm).
   const [parkings, setParkings] = useState<OsmParking[]>(() =>
     Array.from(allParkings.values()),
   );
-  const [loading,  setLoading]  = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  // Per-instance rate-limiting state — refs so mutations never cause re-renders
-  const debounceTimer     = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const abortCtrl         = useRef<AbortController | null>(null);
-  const cooldownUntil     = useRef<number>(0);
-  const lastFetchCenter   = useRef<LatLng | null>(null);
-  const lastFetchLatDelta = useRef<number>(0);
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortCtrl     = useRef<AbortController | null>(null);
+  const cooldownUntil = useRef<number>(0);
 
+  // ── AsyncStorage hydration ─────────────────────────────────────────────────
+  // Runs once per JS process (storageLoaded flag).  Loads the persisted
+  // snapshot into allParkings so the user sees all previously discovered
+  // parkings the instant the map mounts, before any network request fires.
+  useEffect(() => {
+    if (storageLoaded) return;
+    storageLoaded = true;
+
+    AsyncStorage.getItem(STORAGE_KEY)
+      .then(raw => {
+        if (!raw) return;
+        const stored: OsmParking[] = JSON.parse(raw);
+        const added = mergeIntoCache(stored);
+        if (added > 0) {
+          setParkings(Array.from(allParkings.values()));
+          console.log(`[useMapParkings] hydrated ${added} spots from AsyncStorage`);
+        }
+      })
+      .catch(err => console.warn('[useMapParkings] storage read:', err));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Region fetch ──────────────────────────────────────────────────────────
   const loadForRegion = useCallback((region: Region) => {
 
-    // ── 1. Debounce ───────────────────────────────────────────────────────────
+    // ── 1. Debounce ─────────────────────────────────────────────────────────
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
 
     debounceTimer.current = setTimeout(async () => {
 
-      // ── 2. Zoom guard ─────────────────────────────────────────────────────
-      // Do NOT wipe markers when zooming out — they stay visible so the user
-      // can see where they've already explored.
-      if (deltaToZoom(region.latitudeDelta) < MIN_ZOOM) return;
-
-      // ── 3. Cooldown guard (back-off after 429) ────────────────────────────
-      if (Date.now() < cooldownUntil.current) return;
-
-      // ── 4. Minimum distance guard ─────────────────────────────────────────
-      const centre = regionCenter(region);
-      if (lastFetchCenter.current && lastFetchLatDelta.current > 0) {
-        const distM     = haversineDistance(lastFetchCenter.current, centre);
-        const zoomShift = Math.abs(region.latitudeDelta - lastFetchLatDelta.current)
-                          / lastFetchLatDelta.current;
-        if (distM < MIN_FETCH_DIST_M && zoomShift < ZOOM_CHANGE_FRAC) return;
+      // ── 2. Zoom guard ──────────────────────────────────────────────────────
+      if (deltaToZoom(region.latitudeDelta) < MIN_ZOOM) {
+        console.log(
+          `[useMapParkings] zoom ${deltaToZoom(region.latitudeDelta)} < ${MIN_ZOOM} — skipping`,
+        );
+        return;
       }
 
-      // ── 5. Bbox cache ─────────────────────────────────────────────────────
-      // If we've already fetched this exact tile, all its parkings are already
-      // in `allParkings` (and therefore in state). Nothing to do.
-      const key = regionToKey(region);
-      if (fetchedBboxes.has(key)) return;
+      // ── 3. Cooldown guard ──────────────────────────────────────────────────
+      if (Date.now() < cooldownUntil.current) return;
 
-      // ── 6. Cancel previous in-flight request ─────────────────────────────
+      const newBox = regionToBBox(region);
+
+      // ── 4. Containment check (fast path) ───────────────────────────────────
+      if (isContainedInAny(newBox, fetchedRects)) {
+        console.log('[useMapParkings] viewport fully contained in session cache — skipping');
+        return;
+      }
+
+      // ── 5. Coverage check — skip if ≥40% already fetched ──────────────────
+      // A lower threshold than before (was 80%) because persisted storage
+      // already gives the user rich visual data; we only need the missing 60%+.
+      const fraction = coveredFraction(newBox, fetchedRects);
+      if (fraction >= COVERAGE_THRESHOLD) {
+        console.log(
+          `[useMapParkings] ${(fraction * 100).toFixed(0)}% of viewport in session cache — skipping`,
+        );
+        return;
+      }
+
+      // ── 6. Cancel any in-flight request ───────────────────────────────────
       abortCtrl.current?.abort();
       const ctrl = new AbortController();
       abortCtrl.current = ctrl;
 
-      lastFetchCenter.current   = centre;
-      lastFetchLatDelta.current = region.latitudeDelta;
-
-      // ── 7. Fetch ──────────────────────────────────────────────────────────
-      const { south, west, north, east } = regionToBounds(region);
+      // ── 7. Fetch ───────────────────────────────────────────────────────────
+      const { south, west, north, east } = newBox;
       console.log(
-        `[useMapParkings] fetching bbox: S=${south.toFixed(4)} W=${west.toFixed(4)} N=${north.toFixed(4)} E=${east.toFixed(4)}`,
+        `[useMapParkings] fetching (${(fraction * 100).toFixed(0)}% cached) ` +
+        `S=${south.toFixed(4)} W=${west.toFixed(4)} N=${north.toFixed(4)} E=${east.toFixed(4)}`,
       );
 
       setLoading(true);
@@ -117,27 +205,21 @@ export const useMapParkings = () => {
         const data = await fetchParkingData(south, west, north, east, ctrl.signal);
 
         console.log(`[useMapParkings] received ${data.length} elements from API`);
-        if (data.length === 0) {
-          console.warn('[useMapParkings] 0 results — check bbox coordinates and query tags');
-        }
 
-        // Mark bbox as done BEFORE merging (guards against re-entrant calls)
-        fetchedBboxes.add(key);
+        // Record the fetched bbox before merging to guard re-entrant calls
+        fetchedRects.push(newBox);
 
-        // Merge: add only genuinely new entries; never overwrite existing ones
-        let added = 0;
-        for (const p of data) {
-          if (!allParkings.has(p.id)) {
-            allParkings.set(p.id, p);
-            added++;
-          }
-        }
+        const added = mergeIntoCache(data);
         console.log(
           `[useMapParkings] +${added} new  |  ${allParkings.size} total in session cache`,
         );
 
-        // Derive the array once and push it to React state
-        setParkings(Array.from(allParkings.values()));
+        // Push to React state
+        const snapshot = Array.from(allParkings.values());
+        setParkings(snapshot);
+
+        // Persist the updated cache asynchronously — never blocks the UI
+        if (added > 0) persistCache();
 
       } catch (err: unknown) {
         if (err instanceof Error && err.name === 'AbortError') return;
@@ -146,11 +228,8 @@ export const useMapParkings = () => {
           cooldownUntil.current = Date.now() + COOLDOWN_MS;
           console.warn('[useMapParkings] 429 rate-limited — pausing 5 s');
         } else {
-          // Transient error: reset centre so the same area can be retried
-          lastFetchCenter.current = null;
           console.warn('[useMapParkings] fetch error:', err);
         }
-        // Keep existing markers on screen — never call setParkings([])
 
       } finally {
         if (abortCtrl.current === ctrl) setLoading(false);
