@@ -16,3 +16,28 @@ export type RootStackParamList = {
   Map: undefined;
   ParkingDetails: { spotId: string };
 };
+
+export interface LatLng {
+  latitude: number;
+  longitude: number;
+}
+
+export interface BBox {
+  south: number;
+  west:  number;
+  north: number;
+  east:  number;
+}
+
+export interface OsmParking {
+  id:       string;
+  position: LatLng;
+  polygon:  LatLng[] | null;
+  polyline: LatLng[] | null;
+  tags:     Record<string, string>;
+}
+
+export interface RouteInfo {
+  distance: number;
+  duration: number;
+}

@@ -1,59 +1,72 @@
 import React, { memo } from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, ActivityIndicator, StyleSheet, Platform } from 'react-native';
 import { Marker } from 'react-native-maps';
-import { ParkingSpot, ParkingType } from '../types/parking';
+import { OsmParking } from '../types/parking';
 
-interface MarkerConfig {
-  color: string;
-  label: string;
+interface Props {
+  parking:           OsmParking;
+  isSelected:        boolean;
+  isLoadingGeometry: boolean;
+  onPress:           (parking: OsmParking) => void;
 }
 
-const TYPE_CONFIG: Record<ParkingType, MarkerConfig> = {
-  free:    { color: '#3B82F6', label: 'F' },
-  paid:    { color: '#EF4444', label: 'P' },
-  unknown: { color: '#6B7280', label: '?' },
-};
-
-interface ParkingMarkerProps {
-  spot: ParkingSpot;
-  onPress: (spot: ParkingSpot) => void;
-}
-
-export const ParkingMarker = memo(({ spot, onPress }: ParkingMarkerProps) => {
-  const { color, label } = TYPE_CONFIG[spot.type];
-
-  return (
-    <Marker
-      coordinate={{ latitude: spot.latitude, longitude: spot.longitude }}
-      title={spot.name}
-      onPress={() => onPress(spot)}
-      tracksViewChanges={false}
+export const ParkingMarker = memo(({
+  parking, isSelected, isLoadingGeometry, onPress,
+}: Props) => (
+  <Marker
+    coordinate={parking.position}
+    // tracksViewChanges must be true while the content is changing (spinner→P)
+    // to let the native layer re-render; false otherwise for 60 fps scrolling
+    tracksViewChanges={isLoadingGeometry}
+    anchor={{ x: 0.5, y: 0.5 }}
+    zIndex={isSelected ? 10 : 1}
+    onPress={() => onPress(parking)}
+  >
+    <View
+      style={[styles.pin, isSelected && styles.pinSelected]}
+      renderToHardwareTextureAndroid={Platform.OS === 'android'}
+      // @ts-ignore — shouldRasterizeIOS is valid but not typed in RN defs
+      shouldRasterizeIOS={!isLoadingGeometry && Platform.OS === 'ios'}
+      collapsable={false}
     >
-      <View style={[styles.pin, { backgroundColor: color }]}>
-        <Text style={styles.label}>{label}</Text>
-      </View>
-    </Marker>
-  );
-});
+      {isLoadingGeometry ? (
+        <ActivityIndicator size="small" color="#ffffff" />
+      ) : (
+        <Text style={[styles.label, isSelected && styles.labelSelected]}>P</Text>
+      )}
+    </View>
+  </Marker>
+));
 
 const styles = StyleSheet.create({
   pin: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 2.5,
-    borderColor: '#ffffff',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.35,
-    shadowRadius: 4,
-    elevation: 6,
+    width:           28,
+    height:          28,
+    borderRadius:    5,
+    backgroundColor: '#007AFF',
+    justifyContent:  'center',
+    alignItems:      'center',
+    borderWidth:     2,
+    borderColor:     '#ffffff',
+    shadowColor:     '#000',
+    shadowOffset:    { width: 0, height: 2 },
+    shadowOpacity:   0.30,
+    shadowRadius:    4,
+    elevation:       6,
+  },
+  pinSelected: {
+    width:         34,
+    height:        34,
+    shadowOpacity: 0.55,
+    shadowRadius:  7,
+    elevation:     10,
   },
   label: {
-    color: '#ffffff',
-    fontWeight: 'bold',
-    fontSize: 14,
+    color:      '#ffffff',
+    fontWeight: '800',
+    fontSize:   13,
+  },
+  labelSelected: {
+    fontSize: 15,
   },
 });
