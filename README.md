@@ -6,14 +6,14 @@ A production-ready React Native (Expo) app to find and browse free parking spots
 
 ## Tech Stack
 
-| Layer | Library |
-|---|---|
-| Framework | React Native + Expo SDK 51 |
-| Language | TypeScript (strict) |
-| Map | react-native-maps + OpenStreetMap UrlTile |
-| State | Zustand |
-| Navigation | React Navigation (Native Stack) |
-| Styling | NativeWind v4 (Tailwind CSS) |
+| Layer      | Library                                   |
+| ---------- | ----------------------------------------- |
+| Framework  | React Native + Expo SDK 51                |
+| Language   | TypeScript (strict)                       |
+| Map        | react-native-maps + OpenStreetMap UrlTile |
+| State      | Zustand                                   |
+| Navigation | React Navigation (Native Stack)           |
+| Styling    | NativeWind v4 (Tailwind CSS)              |
 
 ---
 
@@ -32,6 +32,7 @@ npx expo start
 ```
 
 Then press:
+
 - `i` → iOS Simulator
 - `a` → Android Emulator
 - Scan QR code → Expo Go on a physical device
@@ -81,8 +82,8 @@ Add entries to `data/parkingSpots.json`. Each entry follows this shape:
 {
   "id": "21",
   "name": "My New Spot",
-  "latitude": 36.7200,
-  "longitude": -4.4180,
+  "latitude": 36.72,
+  "longitude": -4.418,
   "type": "free",
   "description": "Short description shown on the details screen.",
   "address": "Street name, Málaga",
@@ -93,17 +94,17 @@ Add entries to `data/parkingSpots.json`. Each entry follows this shape:
 
 **Field reference:**
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `id` | string | Yes | Must be unique |
-| `name` | string | Yes | Shown on marker tooltip and details |
-| `latitude` | number | Yes | Decimal degrees |
-| `longitude` | number | Yes | Decimal degrees (negative = West) |
-| `type` | `"free"` \| `"paid"` \| `"unknown"` | Yes | Controls marker colour |
-| `description` | string | Yes | Paragraph shown on details screen |
-| `address` | string | No | Shown as an info row |
-| `maxHours` | number \| null | No | `null` = no limit |
-| `notes` | string | No | Shown as an info row |
+| Field         | Type                                | Required | Notes                               |
+| ------------- | ----------------------------------- | -------- | ----------------------------------- |
+| `id`          | string                              | Yes      | Must be unique                      |
+| `name`        | string                              | Yes      | Shown on marker tooltip and details |
+| `latitude`    | number                              | Yes      | Decimal degrees                     |
+| `longitude`   | number                              | Yes      | Decimal degrees (negative = West)   |
+| `type`        | `"free"` \| `"paid"` \| `"unknown"` | Yes      | Controls marker colour              |
+| `description` | string                              | Yes      | Paragraph shown on details screen   |
+| `address`     | string                              | No       | Shown as an info row                |
+| `maxHours`    | number \| null                      | No       | `null` = no limit                   |
+| `notes`       | string                              | No       | Shown as an info row                |
 
 The store loads this file at startup — no API call needed. For real data, replace the JSON import in `store/parkingStore.ts` with a `fetch` call.
 
@@ -111,24 +112,24 @@ The store loads this file at startup — no API call needed. For real data, repl
 
 ## Where to Modify Map Logic
 
-| What to change | Where |
-|---|---|
-| Initial map center / zoom | `screens/MapScreen.tsx` → `MALAGA_REGION` constant |
-| Map tile provider (OSM URL) | `screens/MapScreen.tsx` → `<UrlTile urlTemplate="..." />` |
-| Marker colours / labels | `components/ParkingMarker.tsx` → `TYPE_CONFIG` |
+| What to change                      | Where                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| Initial map center / zoom           | `screens/MapScreen.tsx` → `MALAGA_REGION` constant                       |
+| Map tile provider (OSM URL)         | `screens/MapScreen.tsx` → `<UrlTile urlTemplate="..." />`                |
+| Marker colours / labels             | `components/ParkingMarker.tsx` → `TYPE_CONFIG`                           |
 | Add filter types (e.g. "paid only") | `store/parkingStore.ts` → extend `filterFreeOnly` to a `filterType` enum |
-| Navigation between screens | `app/Navigation.tsx` + `types/parking.ts` → `RootStackParamList` |
-| Header colours / style | `app/Navigation.tsx` → `screenOptions` |
+| Navigation between screens          | `app/Navigation.tsx` + `types/parking.ts` → `RootStackParamList`         |
+| Header colours / style              | `app/Navigation.tsx` → `screenOptions`                                   |
 
 ---
 
 ## Marker Colour Key
 
-| Colour | Type |
-|---|---|
+| Colour         | Type         |
+| -------------- | ------------ |
 | Blue `#3B82F6` | Free parking |
-| Red `#EF4444` | Paid parking |
-| Gray `#6B7280` | Unknown |
+| Red `#EF4444`  | Paid parking |
+| Gray `#6B7280` | Unknown      |
 
 ---
 

@@ -1,21 +1,45 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { View, TouchableOpacity, Text, StyleSheet } from 'react-native';
-import MapView, { UrlTile, PROVIDER_DEFAULT, Region } from 'react-native-maps';
-import MapViewDirections from 'react-native-maps-directions';
-import * as Location from 'expo-location';
-import { OsmParking, LatLng, BBox, RouteInfo } from '../types/parking';
-import { useMapParkings } from '../hooks/useMapParkings';
-import { useGeometryLoader } from '../hooks/useGeometryLoader';
-import { ParkingLayer } from '../components/ParkingLayer';
-import { LoadingOverlay }      from '../components/LoadingOverlay';
-import { GeometryLoadingBar }  from '../components/GeometryLoadingBar';
-import { RouteBottomSheet }    from '../components/RouteBottomSheet';
-import { MAPS_APIKEY } from '../constants/maps';
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  View,
+  TouchableOpacity,
+  Text,
+  StyleSheet,
+  ActivityIndicator,
+} from "react-native";
+import MapView, {
+  UrlTile,
+  PROVIDER_DEFAULT,
+  Marker,
+  Callout,
+  MapMarker,
+  LongPressEvent,
+  Region,
+} from "react-native-maps";
+import { useNavigation } from "@react-navigation/native";
+import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import * as Location from "expo-location";
+import MapViewDirections from "react-native-maps-directions";
 
-export const MALAGA_REGION: Region = {
-  latitude:       36.7213,
-  longitude:      -4.4214,
-  latitudeDelta:  0.09,
+import { SpotMarker } from "../components/SpotMarker";
+import { FilterToggle } from "../components/FilterToggle";
+import { MapLegend } from "../components/MapLegend";
+import { SearchBar } from "../components/SearchBar";
+import { ParkingLayer } from "../components/ParkingLayer";
+import { LoadingOverlay } from "../components/LoadingOverlay";
+import { GeometryLoadingBar } from "../components/GeometryLoadingBar";
+import { RouteBottomSheet } from "../components/RouteBottomSheet";
+import { useParkingStore, useFilteredSpots } from "../store/useParkingStore";
+import { useMapParkings } from "../hooks/useMapParkings";
+import { useGeometryLoader } from "../hooks/useGeometryLoader";
+import { OsmParking, LatLng, BBox, RouteInfo, RootStackParamList } from "../types/parking";
+import { MAPS_APIKEY } from "../constants/maps";
+
+type MapNav = NativeStackNavigationProp<RootStackParamList, "Map">;
+
+export const MALAGA_REGION = {
+  latitude: 36.7213,
+  longitude: -4.4214,
+  latitudeDelta: 0.09,
   longitudeDelta: 0.06,
 };
 
@@ -29,46 +53,74 @@ function regionToBBox(r: Region): BBox {
 }
 
 export const MapScreen: React.FC = () => {
-  const mapRef               = useRef<MapView>(null);
-  const regionDebounceTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Guard: Marker.onPress and MapView.onPress both fire for the same physical tap
-  // on iOS (UITapGestureRecognizer runs alongside MKAnnotationView selection).
-  // We set this flag inside handlePressMarker so the map-press handler can bail.
-  const markerJustTappedRef  = useRef(false);
-  // Interaction lock: prevents multiple rapid taps on different markers from
-  // queuing up simultaneous state updates and geometry fetches.
-  const isProcessingRef      = useRef(false);
+  const navigation = useNavigation<MapNav>();
+  const { setSelectedSpot } = useParkingStore();
+  const filteredSpots = useFilteredSpots();
 
-  // ── Step 1: fast markers (out center — centroid only, no geometry) ────────
+  // ── OSM parking zone hooks ───────────────────────────────────────────────────
   const { parkings, loading, loadForRegion } = useMapParkings();
-
-  // ── Step 2: lazy geometry (fetched on tap, cached per parking ID) ─────────
   const { geometry, geometryLoading, loadGeometry, clearGeometry } = useGeometryLoader();
 
-  // Viewport — latDelta drives zoom level; bounds feed supercluster getClusters()
-  const [latDelta,       setLatDelta]       = useState(MALAGA_REGION.latitudeDelta);
-  const [viewportBounds, setViewportBounds] = useState<BBox>(() => regionToBBox(MALAGA_REGION));
+  // ── Refs ─────────────────────────────────────────────────────────────────────
+  const mapRef              = useRef<MapView | null>(null);
+  const droppedMarkerRef    = useRef<MapMarker | null>(null);
+  const searchMarkerRef     = useRef<MapMarker | null>(null);
+  // Guard: Marker.onPress and MapView.onPress both fire for the same physical tap
+  // on iOS. We set this flag inside handlePressParkingZone so handleMapPress can bail.
+  const markerJustTappedRef = useRef(false);
+  // Prevents multiple rapid taps from queuing simultaneous geometry fetches.
+  const isProcessingRef     = useRef(false);
+  const regionDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Selected parking — drives geometry fetch + bottom sheet
+  // ── Search / long-press pin state ────────────────────────────────────────────
+  const [searchPin, setSearchPin] = useState<{
+    latitude: number;
+    longitude: number;
+    address: string;
+  } | null>(null);
+
+  const [droppedPin, setDroppedPin] = useState<{
+    id: number;
+    latitude: number;
+    longitude: number;
+    address: string;
+    loading: boolean;
+  } | null>(null);
+
+  // ── OSM parking zone state ────────────────────────────────────────────────────
+  const [latDelta,          setLatDelta]          = useState(MALAGA_REGION.latitudeDelta);
+  const [viewportBounds,    setViewportBounds]    = useState<BBox>(() => regionToBBox(MALAGA_REGION));
   const [selectedParking,   setSelectedParking]   = useState<OsmParking | null>(null);
-  // ID-only selection state — sole gate for polygon/polyline rendering
   const [selectedParkingId, setSelectedParkingId] = useState<string | null>(null);
-
-  // Navigation
-  const [activeRoute, setActiveRoute] = useState(false);
-  const [routeInfo,   setRouteInfo]   = useState<RouteInfo | null>(null);
-
-  // User location — required for straight-line distance + routing
-  const [userLocation, setUserLocation] = useState<LatLng | null>(null);
+  const [activeRoute,       setActiveRoute]       = useState(false);
+  const [routeInfo,         setRouteInfo]         = useState<RouteInfo | null>(null);
+  const [userLocation,      setUserLocation]      = useState<LatLng | null>(null);
 
   const hasApiKey = MAPS_APIKEY.length > 0;
 
-  // ── Location permission + live tracking ───────────────────────────────────
+  // ── Effects ───────────────────────────────────────────────────────────────────
+  // Auto-show callout after dropped pin finishes reverse-geocoding
+  useEffect(() => {
+    if (droppedPin && !droppedPin.loading) {
+      const t = setTimeout(() => droppedMarkerRef.current?.showCallout(), 400);
+      return () => clearTimeout(t);
+    }
+  }, [droppedPin?.id, droppedPin?.loading]);
+
+  // Auto-show callout for search result pin
+  useEffect(() => {
+    if (searchPin) {
+      const t = setTimeout(() => searchMarkerRef.current?.showCallout(), 500);
+      return () => clearTimeout(t);
+    }
+  }, [searchPin]);
+
+  // Location permission + live tracking for routing distance calculation
   useEffect(() => {
     let sub: Location.LocationSubscription | null = null;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
+      if (status !== "granted") return;
       sub = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.Balanced, distanceInterval: 10 },
         (loc) =>
@@ -78,22 +130,20 @@ export const MapScreen: React.FC = () => {
     return () => { sub?.remove(); };
   }, []);
 
-  // Trigger initial data load (onRegionChangeComplete may not fire on first render)
+  // Trigger initial OSM parking zone load (onRegionChangeComplete may not fire on first render)
   useEffect(() => {
     loadForRegion(MALAGA_REGION);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Clean up debounce timer on unmount
+  // Debounce timer cleanup
   useEffect(() => {
     return () => {
       if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
     };
   }, []);
 
-  // ── Map event handlers ────────────────────────────────────────────────────
-  // Debounce the entire handler so rapid onRegionChangeComplete bursts (e.g.
-  // back-to-back programmatic animations) collapse into a single state update
-  // and a single API-trigger — prevents Supercluster rebuilds and API spam.
+  // ── Map event handlers ────────────────────────────────────────────────────────
+  // Debounced: updates viewport state and triggers OSM zone fetch on pan/zoom
   const handleRegionChangeComplete = useCallback((region: Region) => {
     if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
     regionDebounceTimer.current = setTimeout(() => {
@@ -103,17 +153,61 @@ export const MapScreen: React.FC = () => {
     }, 500);
   }, [loadForRegion]);
 
-  const handlePressMarker = useCallback((parking: OsmParking) => {
-    // Drop fast-tap repeats — if a state update + geometry fetch is already
-    // in flight, ignore the new tap.  The lock releases after 300 ms which is
-    // enough for React to flush the first batch and for the native map to
-    // visually confirm the selection.
+  // Map tap: clears search/dropped pins AND deselects any OSM parking zone.
+  // markerJustTappedRef guard prevents iOS double-fire (Marker.onPress + MapView.onPress).
+  const handleMapPress = useCallback(() => {
+    if (markerJustTappedRef.current) return;
+    setDroppedPin(null);
+    setSearchPin(null);
+    setSelectedParking(null);
+    setSelectedParkingId(null);
+    setActiveRoute(false);
+    setRouteInfo(null);
+    clearGeometry();
+  }, [clearGeometry]);
+
+  // Long-press: drops a pin with reverse-geocoded address
+  const handleLongPress = useCallback(async (e: LongPressEvent) => {
+    setSearchPin(null);
+    const { latitude, longitude } = e.nativeEvent.coordinate;
+    const newId = Date.now();
+
+    setDroppedPin({ id: newId, latitude, longitude, loading: true, address: "Searching..." });
+
+    try {
+      const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
+      const addr = place
+        ? `${place.street || ""} ${place.streetNumber || ""}`.trim() || "Point"
+        : "Point";
+      setDroppedPin((prev) =>
+        prev?.id === newId ? { ...prev, address: addr, loading: false } : prev,
+      );
+    } catch {
+      setDroppedPin((prev) =>
+        prev?.id === newId ? { ...prev, address: "Point", loading: false } : prev,
+      );
+    }
+  }, []);
+
+  // Search result selected: places a pin and animates camera
+  const handleLocationSelect = useCallback(
+    async (lat: number, lon: number, addr?: string) => {
+      setDroppedPin(null);
+      setSearchPin({ latitude: lat, longitude: lon, address: addr || "Selected Point" });
+      mapRef.current?.animateToRegion(
+        { latitude: lat, longitude: lon, latitudeDelta: 0.003, longitudeDelta: 0.003 },
+        800,
+      );
+    },
+    [],
+  );
+
+  // OSM parking zone marker tapped: triggers geometry fetch and bottom sheet
+  const handlePressParkingZone = useCallback((parking: OsmParking) => {
     if (isProcessingRef.current) return;
     isProcessingRef.current = true;
     setTimeout(() => { isProcessingRef.current = false; }, 300);
 
-    // Raise the flag so handleMapPress (which fires immediately after on iOS)
-    // knows this touch was on a marker and should not deselect.
     markerJustTappedRef.current = true;
     requestAnimationFrame(() => { markerJustTappedRef.current = false; });
 
@@ -124,8 +218,8 @@ export const MapScreen: React.FC = () => {
     loadGeometry(parking);
   }, [loadGeometry]);
 
+  // Cluster tapped: zoom in to break the cluster apart
   const handlePressCluster = useCallback((position: LatLng) => {
-    // Zoom in by halving both deltas — breaks the cluster apart at the next zoom level
     const span = viewportBounds.north - viewportBounds.south;
     mapRef.current?.animateToRegion(
       {
@@ -138,41 +232,16 @@ export const MapScreen: React.FC = () => {
     );
   }, [viewportBounds]);
 
-  // ── Bottom sheet handlers ─────────────────────────────────────────────────
-  const handleStartRoute = useCallback(() => {
-    setActiveRoute(true);
-    setRouteInfo(null);
-  }, []);
-
-  const handleCancelRoute = useCallback(() => {
-    setActiveRoute(false);
-    setRouteInfo(null);
-  }, []);
-
-  // Called by the bottom-sheet close button — always deselects.
-  const handleCloseSheet = useCallback(() => {
+  // ── Bottom sheet handlers ─────────────────────────────────────────────────────
+  const handleStartRoute  = useCallback(() => { setActiveRoute(true); setRouteInfo(null); }, []);
+  const handleCancelRoute = useCallback(() => { setActiveRoute(false); setRouteInfo(null); }, []);
+  const handleCloseSheet  = useCallback(() => {
     setSelectedParking(null);
     setSelectedParkingId(null);
     setActiveRoute(false);
     setRouteInfo(null);
     clearGeometry();
   }, [clearGeometry]);
-
-  // Called by MapView.onPress (empty-map tap) — deselects ONLY when the tap
-  // was not on a marker.  Without this guard, Marker.onPress + MapView.onPress
-  // both fire for the same touch on iOS, causing an instant open-then-close.
-  const handleMapPress = useCallback(() => {
-    if (markerJustTappedRef.current) return;
-    setSelectedParking(null);
-    setSelectedParkingId(null);
-    setActiveRoute(false);
-    setRouteInfo(null);
-    clearGeometry();
-  }, [clearGeometry]);
-
-  const handleRecenter = useCallback(() => {
-    mapRef.current?.animateToRegion(MALAGA_REGION, 800);
-  }, []);
 
   return (
     <View style={styles.container}>
@@ -184,16 +253,42 @@ export const MapScreen: React.FC = () => {
         mapType="none"
         showsUserLocation
         showsMyLocationButton={false}
-        onRegionChangeComplete={handleRegionChangeComplete}
+        onLongPress={handleLongPress}
         onPress={handleMapPress}
+        onRegionChangeComplete={handleRegionChangeComplete}
+        mapPadding={{ top: 120, right: 0, bottom: 0, left: 0 }}
       >
         <UrlTile
-          urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-          maximumZ={19}
-          flipY={false}
+          urlTemplate="https://openstreetmap.org{z}/{x}/{y}.png"
           zIndex={-1}
         />
 
+        {/* JSON parking spots from local data (filtered by free/all toggle) */}
+        {filteredSpots.map((spot) => (
+          <SpotMarker
+            key={spot.id}
+            spot={spot}
+            onPress={(s) => {
+              setSelectedSpot(s);
+              navigation.navigate("ParkingDetails", { spotId: s.id });
+            }}
+          />
+        ))}
+
+        {/* OSM parking zones fetched from Overpass API — clusters + polygons */}
+        <ParkingLayer
+          parkings={parkings}
+          selectedParkingId={selectedParkingId}
+          latitudeDelta={latDelta}
+          viewportBounds={viewportBounds}
+          onPressMarker={handlePressParkingZone}
+          onPressCluster={handlePressCluster}
+          selectedPolygon={geometry?.polygon ?? null}
+          selectedPolyline={geometry?.polyline ?? null}
+          geometryLoading={geometryLoading}
+        />
+
+        {/* Route polyline (requires Google Maps API key in constants/maps.ts) */}
         {activeRoute && hasApiKey && userLocation && selectedParking && (
           <MapViewDirections
             origin={userLocation}
@@ -207,37 +302,88 @@ export const MapScreen: React.FC = () => {
           />
         )}
 
-        <ParkingLayer
-          parkings={parkings}
-          selectedParkingId={selectedParkingId}
-          latitudeDelta={latDelta}
-          viewportBounds={viewportBounds}
-          onPressMarker={handlePressMarker}
-          onPressCluster={handlePressCluster}
-          selectedPolygon={geometry?.polygon ?? null}
-          selectedPolyline={geometry?.polyline ?? null}
-          geometryLoading={geometryLoading}
-        />
+        {/* Search result pin */}
+        {searchPin && (
+          <Marker
+            key={`search-${searchPin.latitude}`}
+            ref={searchMarkerRef}
+            coordinate={{ latitude: searchPin.latitude, longitude: searchPin.longitude }}
+            anchor={{ x: 0.5, y: 1 }}
+          >
+            <CustomPinView color="#EF4444" />
+            <Callout>
+              <View style={styles.callout}>
+                <Text style={styles.calloutText}>{searchPin.address}</Text>
+                <Text style={styles.coordsText}>
+                  {searchPin.latitude.toFixed(6)}, {searchPin.longitude.toFixed(6)}
+                </Text>
+              </View>
+            </Callout>
+          </Marker>
+        )}
+
+        {/* Long-press dropped pin with reverse-geocoded address */}
+        {droppedPin && (
+          <Marker
+            key={`drop-${droppedPin.id}`}
+            ref={droppedMarkerRef}
+            coordinate={{ latitude: droppedPin.latitude, longitude: droppedPin.longitude }}
+            anchor={{ x: 0.5, y: 1 }}
+          >
+            <CustomPinView color="#EF4444" />
+            <Callout>
+              <View style={styles.callout}>
+                {droppedPin.loading ? (
+                  <ActivityIndicator size="small" color="#EF4444" />
+                ) : (
+                  <>
+                    <Text style={styles.calloutText}>{droppedPin.address}</Text>
+                    <Text style={styles.coordsText}>
+                      {droppedPin.latitude.toFixed(6)}, {droppedPin.longitude.toFixed(6)}
+                    </Text>
+                  </>
+                )}
+              </View>
+            </Callout>
+          </Marker>
+        )}
       </MapView>
 
-      {/* Thin sliding bar at top — geometry fetch OR main fetch (mirror rotation
-          can take several seconds; give the user visible progress for both) */}
+      {/* Thin animated bar at screen top — visible during any fetch */}
       <GeometryLoadingBar visible={geometryLoading || loading} />
+      {/* Spinner below the header — only during main markers fetch */}
+      <LoadingOverlay visible={loading} top={140} />
 
-      {/* Spinner below status bar — visible during the main markers fetch */}
-      <LoadingOverlay visible={loading} />
+      {/* Header: search bar + free/all filter toggle */}
+      <View style={styles.headerWrapper}>
+        <View style={styles.searchBox}>
+          <SearchBar
+            mapRef={mapRef as any}
+            onLocationSelect={handleLocationSelect}
+            onClear={() => setSearchPin(null)}
+          />
+        </View>
+        <View style={styles.filterBox}>
+          <FilterToggle />
+        </View>
+      </View>
 
-      {/* Recenter — sits above the bottom sheet (sheet height = 240) */}
-      <View style={styles.recenterWrap}>
+      {/* Colour legend — bottom left, above the bottom sheet */}
+      <View style={styles.legendContainer}>
+        <MapLegend />
+      </View>
+
+      {/* Recenter — bottom right, above the bottom sheet */}
+      <View style={styles.recenterContainer}>
         <TouchableOpacity
-          onPress={handleRecenter}
-          activeOpacity={0.85}
-          style={styles.recenterBtn}
+          style={styles.recenterButton}
+          onPress={() => mapRef.current?.animateToRegion(MALAGA_REGION, 800)}
         >
-          <Text style={styles.recenterIcon}>📍</Text>
+          <Text style={{ fontSize: 25 }}>📍</Text>
         </TouchableOpacity>
       </View>
 
+      {/* OSM parking zone detail + routing bottom sheet */}
       <RouteBottomSheet
         parking={selectedParking}
         activeRoute={activeRoute}
@@ -252,24 +398,75 @@ export const MapScreen: React.FC = () => {
   );
 };
 
+const CustomPinView = ({ color }: { color: string }) => (
+  <View style={pinStyles.container}>
+    <View style={[pinStyles.head, { backgroundColor: color }]}>
+      <View style={pinStyles.dot} />
+    </View>
+    <View style={[pinStyles.needle, { backgroundColor: color }]} />
+  </View>
+);
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  map:       { flex: 1 },
-  recenterWrap: {
-    position: 'absolute',
-    bottom:   260,
-    right:    16,
+  map: { flex: 1 },
+  headerWrapper: {
+    position: "absolute",
+    top: 35,
+    left: 16,
+    right: 16,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    zIndex: 100,
   },
-  recenterBtn: {
-    backgroundColor: '#ffffff',
-    width: 48, height: 48, borderRadius: 24,
-    justifyContent:  'center',
-    alignItems:      'center',
-    shadowColor:     '#000',
-    shadowOffset:    { width: 0, height: 2 },
-    shadowOpacity:   0.15,
-    shadowRadius:    6,
-    elevation:       8,
+  searchBox: { flex: 1, zIndex: 110 },
+  filterBox: { marginLeft: 10, zIndex: 100 },
+  legendContainer: { position: "absolute", bottom: 260, left: 15 },
+  recenterContainer: { position: "absolute", bottom: 260, right: 20 },
+  recenterButton: {
+    backgroundColor: "white",
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 4,
+    shadowColor: "#000",
+    shadowOpacity: 0.3,
   },
-  recenterIcon: { fontSize: 20 },
+  callout: {
+    padding: 10,
+    backgroundColor: "white",
+    borderRadius: 10,
+    minWidth: 140,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  calloutText: {
+    fontSize: 13,
+    fontWeight: "bold",
+    color: "#1F2937",
+    textAlign: "center",
+  },
+  coordsText: {
+    fontSize: 11,
+    color: "#6B7280",
+    marginTop: 2,
+    textAlign: "center",
+  },
+});
+
+const pinStyles = StyleSheet.create({
+  container: { alignItems: "center", width: 30, height: 40 },
+  head: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: "white",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "white" },
+  needle: { width: 4, height: 12, marginTop: -3, borderRadius: 2 },
 });

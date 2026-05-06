@@ -3,12 +3,13 @@ import { ActivityIndicator, View, StyleSheet } from 'react-native';
 
 interface Props {
   visible: boolean;
+  top?: number;
 }
 
-export const LoadingOverlay: React.FC<Props> = ({ visible }) => {
+export const LoadingOverlay: React.FC<Props> = ({ visible, top }) => {
   if (!visible) return null;
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, top !== undefined && { top }]}>
       <ActivityIndicator size="small" color="#007AFF" />
     </View>
   );
