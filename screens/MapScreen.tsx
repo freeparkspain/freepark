@@ -1,3 +1,4 @@
+// npm install babel-preset-expo --save-dev
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   View,
@@ -5,6 +6,8 @@ import {
   Text,
   StyleSheet,
   ActivityIndicator,
+  Keyboard,
+  Platform,
 } from "react-native";
 import MapView, {
   UrlTile,
@@ -42,6 +45,10 @@ export const MALAGA_REGION = {
   latitudeDelta: 0.09,
   longitudeDelta: 0.06,
 };
+
+// Default vertical offset (from the bottom of the screen) for the recenter button.
+// Lowered so the button sits near the bottom; it lifts above the keyboard when open.
+const RECENTER_BOTTOM_DEFAULT = 40;
 
 function regionToBBox(r: Region): BBox {
   return {
@@ -96,6 +103,10 @@ export const MapScreen: React.FC = () => {
   const [routeInfo,         setRouteInfo]         = useState<RouteInfo | null>(null);
   const [userLocation,      setUserLocation]      = useState<LatLng | null>(null);
 
+  // ── Keyboard state ─────────────────────────────────────────────────────────────
+  // Tracks the on-screen keyboard height so the recenter button can lift above it.
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
   const hasApiKey = MAPS_APIKEY.length > 0;
 
   // ── Effects ───────────────────────────────────────────────────────────────────
@@ -139,6 +150,23 @@ export const MapScreen: React.FC = () => {
   useEffect(() => {
     return () => {
       if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
+    };
+  }, []);
+
+  // Keyboard listeners: lift the recenter button above the keyboard while it is open,
+  // and return it to its default lower position when the keyboard is dismissed.
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+
+    const showSub = Keyboard.addListener(showEvent, (e) =>
+      setKeyboardHeight(e.endCoordinates?.height ?? 0),
+    );
+    const hideSub = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
     };
   }, []);
 
@@ -368,13 +396,13 @@ export const MapScreen: React.FC = () => {
         </View>
       </View>
 
-      {/* Colour legend — bottom left, above the bottom sheet */}
-      <View style={styles.legendContainer}>
-        <MapLegend />
-      </View>
-
-      {/* Recenter — bottom right, above the bottom sheet */}
-      <View style={styles.recenterContainer}>
+      {/* Recenter — bottom right; lifts above the keyboard when it opens */}
+      <View
+        style={[
+          styles.recenterContainer,
+          { bottom: keyboardHeight > 0 ? keyboardHeight + 12 : RECENTER_BOTTOM_DEFAULT },
+        ]}
+      >
         <TouchableOpacity
           style={styles.recenterButton}
           onPress={() => mapRef.current?.animateToRegion(MALAGA_REGION, 800)}
