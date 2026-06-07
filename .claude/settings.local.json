@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"console.log\\(require\\('./node_modules/.bin/expo'\\)\\)\")",
+      "Bash(node -e \"require\\('expo/AppEntry'\\)\")",
+      "Bash(npm --version)",
+      "Bash(npm run *)",
+      "Bash(node *)",
+      "Bash(npx expo *)",
+      "Bash(npm exec *)",
+      "Bash(npm install *)",
+      "Bash(git -C /Users/danielkraft/freepark status --short)",
+      "Bash(git -C /Users/danielkraft/freepark rm -r --cached node_modules)",
+      "Bash(git -C /Users/danielkraft/freepark diff --cached --name-status)",
+      "Bash(git -C /Users/danielkraft/freepark status -- .gitignore)",
+      "Bash(curl -s --max-time 5 \"https://nominatim.openstreetmap.org/search?q=malaga&format=json&limit=1&email=freepark.spain@gmail.com\" -o /dev/null -w \"%{http_code}\")",
+      "Bash(curl -s --max-time 5 \"https://photon.komoot.io/api/?q=malaga&limit=1\" -o /dev/null -w \"%{http_code}\")",
+      "Bash(npx tsc *)",
+      "Bash(npx --yes tsc --noEmit)"
+    ]
+  }
+}
