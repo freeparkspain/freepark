@@ -15,6 +15,7 @@ import MapView, {
   Marker,
   Callout,
   MapMarker,
+  Polyline,
   LongPressEvent,
   Region,
 } from "react-native-maps";
@@ -34,8 +35,9 @@ import { RouteBottomSheet } from "../components/RouteBottomSheet";
 import { useParkingStore, useFilteredSpots } from "../store/useParkingStore";
 import { useMapParkings } from "../hooks/useMapParkings";
 import { useGeometryLoader } from "../hooks/useGeometryLoader";
-import { OsmParking, LatLng, BBox, RouteInfo, RootStackParamList } from "../types/parking";
-import { MAPS_APIKEY } from "../constants/maps";
+import { OsmParking, LatLng, BBox, RouteInfo, RootStackParamList, SelectedDestination } from "../types/parking";
+import { MAPS_APIKEY, NAVIGATION_PROVIDER } from "../constants/maps";
+import { fetchOsrmRoute } from "../services/navigation/osrmNavigation";
 
 type MapNav = NativeStackNavigationProp<RootStackParamList, "Map">;
 
@@ -78,6 +80,7 @@ export const MapScreen: React.FC = () => {
   // Prevents multiple rapid taps from queuing simultaneous geometry fetches.
   const isProcessingRef     = useRef(false);
   const regionDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const osrmFetchIdRef      = useRef(0);
 
   // ── Search / long-press pin state ────────────────────────────────────────────
   const [searchPin, setSearchPin] = useState<{
@@ -97,17 +100,19 @@ export const MapScreen: React.FC = () => {
   // ── OSM parking zone state ────────────────────────────────────────────────────
   const [latDelta,          setLatDelta]          = useState(MALAGA_REGION.latitudeDelta);
   const [viewportBounds,    setViewportBounds]    = useState<BBox>(() => regionToBBox(MALAGA_REGION));
-  const [selectedParking,   setSelectedParking]   = useState<OsmParking | null>(null);
   const [selectedParkingId, setSelectedParkingId] = useState<string | null>(null);
   const [activeRoute,       setActiveRoute]       = useState(false);
   const [routeInfo,         setRouteInfo]         = useState<RouteInfo | null>(null);
+  const [routeError,        setRouteError]        = useState<string | null>(null);
+  const [osrmPolyline,      setOsrmPolyline]      = useState<LatLng[] | null>(null);
+  const [selectedDestination, setSelectedDestination] = useState<SelectedDestination | null>(null);
   const [userLocation,      setUserLocation]      = useState<LatLng | null>(null);
 
   // ── Keyboard state ─────────────────────────────────────────────────────────────
   // Tracks the on-screen keyboard height so the recenter button can lift above it.
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
-  const hasApiKey = MAPS_APIKEY.length > 0;
+  const canNavigate = NAVIGATION_PROVIDER === 'osrm' || MAPS_APIKEY.length > 0;
 
   // ── Effects ───────────────────────────────────────────────────────────────────
   // Auto-show callout after dropped pin finishes reverse-geocoding
@@ -187,47 +192,87 @@ export const MapScreen: React.FC = () => {
     if (markerJustTappedRef.current) return;
     setDroppedPin(null);
     setSearchPin(null);
-    setSelectedParking(null);
+    setSelectedDestination(null);
     setSelectedParkingId(null);
     setActiveRoute(false);
     setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
     clearGeometry();
   }, [clearGeometry]);
 
-  // Long-press: drops a pin with reverse-geocoded address
+  // Long-press: drops a pin, sets it as navigation destination, reverse-geocodes address
   const handleLongPress = useCallback(async (e: LongPressEvent) => {
     setSearchPin(null);
-    const { latitude, longitude } = e.nativeEvent.coordinate;
-    const newId = Date.now();
+    setSelectedParkingId(null);
+    clearGeometry();
 
-    setDroppedPin({ id: newId, latitude, longitude, loading: true, address: "Searching..." });
+    const { latitude, longitude } = e.nativeEvent.coordinate;
+    const newId    = Date.now();
+    const pinId    = `pin-${newId}`;
+    const position = { latitude, longitude };
+    const coordTitle = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+
+    console.log('[MapScreen] long-press pin placed at:', coordTitle);
+
+    setDroppedPin({ id: newId, latitude, longitude, loading: true, address: 'Searching…' });
+    setSelectedDestination({ id: pinId, type: 'pin', title: coordTitle, position });
+    setActiveRoute(false);
+    setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
+
+    console.log('[MapScreen] selectedDestination set (pin):', coordTitle);
+    console.log('[MapScreen] navigation sheet opening for dropped pin');
 
     try {
       const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
       const addr = place
-        ? `${place.street || ""} ${place.streetNumber || ""}`.trim() || "Point"
-        : "Point";
+        ? `${place.street || ''} ${place.streetNumber || ''}`.trim() || coordTitle
+        : coordTitle;
       setDroppedPin((prev) =>
         prev?.id === newId ? { ...prev, address: addr, loading: false } : prev,
       );
+      setSelectedDestination((prev) =>
+        prev?.id === pinId ? { ...prev, title: addr } : prev,
+      );
+      console.log('[MapScreen] long-press pin geocoded:', addr);
     } catch {
       setDroppedPin((prev) =>
-        prev?.id === newId ? { ...prev, address: "Point", loading: false } : prev,
+        prev?.id === newId ? { ...prev, address: coordTitle, loading: false } : prev,
       );
     }
-  }, []);
+  }, [clearGeometry]);
 
-  // Search result selected: places a pin and animates camera
+  // Search result selected: places a pin, sets navigation destination, animates camera
   const handleLocationSelect = useCallback(
-    async (lat: number, lon: number, addr?: string) => {
+    (lat: number, lon: number, addr?: string) => {
+      const title = addr || 'Selected Point';
+      console.log('[MapScreen] search result selected:', title);
+
       setDroppedPin(null);
-      setSearchPin({ latitude: lat, longitude: lon, address: addr || "Selected Point" });
+      setSearchPin({ latitude: lat, longitude: lon, address: title });
+      setSelectedParkingId(null);
+      setSelectedDestination({
+        id:       `search-${lat}-${lon}`,
+        type:     'search',
+        title,
+        position: { latitude: lat, longitude: lon },
+      });
+      setActiveRoute(false);
+      setRouteInfo(null);
+      setRouteError(null);
+      setOsrmPolyline(null);
+      clearGeometry();
       mapRef.current?.animateToRegion(
         { latitude: lat, longitude: lon, latitudeDelta: 0.003, longitudeDelta: 0.003 },
         800,
       );
+
+      console.log('[MapScreen] selectedDestination set (search):', title);
+      console.log('[MapScreen] navigation sheet opening for search result');
     },
-    [],
+    [clearGeometry],
   );
 
   // OSM parking zone marker tapped: triggers geometry fetch and bottom sheet
@@ -239,11 +284,24 @@ export const MapScreen: React.FC = () => {
     markerJustTappedRef.current = true;
     requestAnimationFrame(() => { markerJustTappedRef.current = false; });
 
-    setSelectedParking(parking);
+    console.log('[MapScreen] parking marker tapped:', parking.id);
+
+    const dest: SelectedDestination = {
+      id:       parking.id,
+      type:     'parking',
+      title:    parking.tags.name ?? parking.tags['name:en'] ?? parking.tags['name:ru'] ?? 'Parking',
+      position: parking.position,
+    };
     setSelectedParkingId(parking.id);
+    setSelectedDestination(dest);
     setActiveRoute(false);
     setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
     loadGeometry(parking);
+
+    console.log('[MapScreen] selectedDestination set (parking):', dest.title);
+    console.log('[MapScreen] navigation sheet opening for parking:', dest.title);
   }, [loadGeometry]);
 
   // Cluster tapped: zoom in to break the cluster apart
@@ -261,13 +319,47 @@ export const MapScreen: React.FC = () => {
   }, [viewportBounds]);
 
   // ── Bottom sheet handlers ─────────────────────────────────────────────────────
-  const handleStartRoute  = useCallback(() => { setActiveRoute(true); setRouteInfo(null); }, []);
-  const handleCancelRoute = useCallback(() => { setActiveRoute(false); setRouteInfo(null); }, []);
-  const handleCloseSheet  = useCallback(() => {
-    setSelectedParking(null);
-    setSelectedParkingId(null);
+  const handleStartRoute = useCallback(() => {
+    if (!selectedDestination) return;
+    console.log('[MapScreen] Start Route pressed for:', selectedDestination.title);
+    setActiveRoute(true);
+    setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
+    if (NAVIGATION_PROVIDER !== 'osrm' || !userLocation) return;
+    const fetchId = ++osrmFetchIdRef.current;
+    console.log('[MapScreen] starting OSRM route fetch...');
+    fetchOsrmRoute(userLocation, selectedDestination.position)
+      .then((r) => {
+        if (osrmFetchIdRef.current !== fetchId) return;
+        console.log('[MapScreen] route ready:', r.routeInfo.distance.toFixed(1), 'km,', r.routeInfo.duration.toFixed(0), 'min');
+        setOsrmPolyline(r.polyline);
+        setRouteInfo(r.routeInfo);
+      })
+      .catch((e) => {
+        if (osrmFetchIdRef.current !== fetchId) return;
+        const msg = e instanceof Error ? e.message : 'Route unavailable';
+        console.warn('[MapScreen] route failed:', msg);
+        setRouteError(msg);
+      });
+  }, [userLocation, selectedDestination]);
+  const handleCancelRoute = useCallback(() => {
+    osrmFetchIdRef.current++;
     setActiveRoute(false);
     setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
+  }, []);
+  const handleCloseSheet = useCallback(() => {
+    osrmFetchIdRef.current++;
+    setSelectedDestination(null);
+    setSelectedParkingId(null);
+    setSearchPin(null);
+    setDroppedPin(null);
+    setActiveRoute(false);
+    setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
     clearGeometry();
   }, [clearGeometry]);
 
@@ -316,17 +408,39 @@ export const MapScreen: React.FC = () => {
           geometryLoading={geometryLoading}
         />
 
-        {/* Route polyline (requires Google Maps API key in constants/maps.ts) */}
-        {activeRoute && hasApiKey && userLocation && selectedParking && (
+        {activeRoute && NAVIGATION_PROVIDER === 'google' && MAPS_APIKEY.length > 0 && userLocation && selectedDestination && (
           <MapViewDirections
             origin={userLocation}
-            destination={selectedParking.position}
+            destination={selectedDestination.position}
             apikey={MAPS_APIKEY}
             strokeWidth={5}
             strokeColor="#007AFF"
-            onReady={(result: { distance: number; duration: number }) =>
-              setRouteInfo({ distance: result.distance, duration: result.duration })
-            }
+            onReady={(result: { distance: number; duration: number }) => {
+              console.log('[MapScreen] Google route ready:', result.distance.toFixed(1), 'km');
+              setRouteInfo({ distance: result.distance, duration: result.duration });
+              setRouteError(null);
+            }}
+            onError={(err: string) => {
+              console.warn('[MapScreen] Google route failed:', err);
+              setRouteError(err || 'Route unavailable');
+            }}
+          />
+        )}
+
+        {activeRoute && NAVIGATION_PROVIDER === 'osrm' && osrmPolyline && (
+          <Polyline
+            coordinates={osrmPolyline}
+            strokeWidth={5}
+            strokeColor="#007AFF"
+          />
+        )}
+
+        {activeRoute && routeError && userLocation && selectedDestination && (
+          <Polyline
+            coordinates={[userLocation, selectedDestination.position]}
+            strokeWidth={3}
+            strokeColor="#9CA3AF"
+            lineDashPattern={[8, 4]}
           />
         )}
 
@@ -413,11 +527,12 @@ export const MapScreen: React.FC = () => {
 
       {/* OSM parking zone detail + routing bottom sheet */}
       <RouteBottomSheet
-        parking={selectedParking}
+        destination={selectedDestination}
         activeRoute={activeRoute}
         routeInfo={routeInfo}
         userLocation={userLocation}
-        hasApiKey={hasApiKey}
+        canNavigate={canNavigate}
+        routeError={routeError}
         onStartRoute={handleStartRoute}
         onCancelRoute={handleCancelRoute}
         onClose={handleCloseSheet}

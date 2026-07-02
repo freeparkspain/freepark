@@ -68,7 +68,6 @@ const ClusterMarker = memo(({ item, onPress }: {
     <Marker
       coordinate={item.position}
       tracksViewChanges={false}
-      calloutEnabled={false}
       anchor={{ x: 0.5, y: 0.5 }}
       onPress={() => onPress(item.position)}
     >

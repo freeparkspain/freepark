@@ -46,7 +46,6 @@ function ParkingMarkerBase({
     <Marker
       coordinate={parking.position}
       tracksViewChanges={tracksViews}
-      calloutEnabled={false}
       anchor={{ x: 0.5, y: 0.5 }}
       zIndex={isSelected ? 10 : 1}
       onPress={() => {

@@ -41,3 +41,10 @@ export interface RouteInfo {
   distance: number;
   duration: number;
 }
+
+export interface SelectedDestination {
+  id:       string;
+  type:     'parking' | 'search' | 'pin';
+  title:    string;
+  position: LatLng;
+}
