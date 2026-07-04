@@ -3,22 +3,21 @@
  *
  * Загружает парковки из OpenStreetMap через Overpass API.
  *
- * ── Overpass QL запрос ──────────────────────────────────────────────────────
+ * ── Двухуровневая загрузка геометрии ────────────────────────────────────────
  *
- *   [out:json][timeout:25][maxsize:2000000]
- *   (
- *     node["amenity"="parking"](bbox);
- *     way["amenity"="parking"](bbox);
- *     relation["amenity"="parking"](bbox);
- *     way["parking"="street_side"](bbox);
- *     way["parking"="lane"](bbox);
- *   );
- *   out center geom;
+ * Полный контур (`out geom`) каждой зоны раздувает payload bulk-запроса в
+ * разы и было основной причиной долгой загрузки — поэтому он больше НЕ
+ * запрашивается за один раз для всего вьюпорта:
  *
- * [maxsize:2000000] → сервер обрежет ответ при превышении 2 MB.
- * out center geom   → для way/relation возвращает:
- *   - center: {lat, lon}        — центральная точка (для иконки маркера)
- *   - geometry: [{lat, lon}…]   — контур (для Polygon / Polyline)
+ *   1. buildOverpassQuery — лёгкий `out center`: только координаты + теги.
+ *      Этого достаточно для маркеров/кластеров и держит первую отрисовку
+ *      быстрой даже над широкими областями.
+ *   2. fetchParkingGeometryBatch — точный `out geom`, но ТОЛЬКО для зон,
+ *      реально видимых при близком зуме (useMapParkings.loadZoneGeometry
+ *      собирает их id и шлёт один комбинированный запрос вместо N лазерных).
+ *
+ * out center → для way/relation: center: {lat, lon}      — центр (иконка)
+ * out geom   → для way/relation: geometry: [{lat, lon}…] — контур (Polygon/Polyline)
  *
  * ── Парсинг геометрии OSM ───────────────────────────────────────────────────
  *
@@ -31,74 +30,104 @@
 
 import { LatLng, OsmParking } from '../types/parking';
 
-// ─── Mirror rotation with blacklisting ───────────────────────────────────────
+// ─── Mirror pools ─────────────────────────────────────────────────────────────
+//
+// Bulk viewport queries (fetchParkingData) and lightweight geometry queries
+// (fetchParkingGeometry / fetchParkingGeometryBatch) use SEPARATE mirror pools.
+//
+// Why this matters: a heavy viewport query legitimately takes 3–6 s on a loaded
+// mirror, so a 6 s per-mirror timeout + 5-minute blacklist is correct for bulk.
+// But single-element geometry queries normally complete in 300–400 ms. When the
+// SAME blacklist state was shared, one bulk timeout would exile a mirror for 5
+// minutes — and all subsequent geometry requests would skip that mirror too,
+// cascading until ALL mirrors were blacklisted and the user's tap opened an
+// empty bottom sheet. Now the two query types can't poison each other.
+//
+// GEO pool extras:
+//   • 3.5 s per-mirror timeout (vs 6 s for bulk) — geometry is fast; fail sooner
+//   • 30 s blacklist (vs 5 min) — brief instability shouldn't lock the user out
+//   • Global 10 s cooldown after all-mirrors-fail — prevents the reset→retry→
+//     fail loop from hammering mirrors when the whole Overpass network is down
 
 const OVERPASS_MIRRORS = [
+  'https://overpass.kumi.systems/api/interpreter',   // CloudFlare CDN — most reliable from EU/ES
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.openstreetmap.ru/api/interpreter',
   'https://lz4.overpass-api.de/api/interpreter',
   'https://overpass.nchc.org.tw/api/interpreter',
 ];
 
-/** Fail fast per mirror — single-element geometry queries should return in < 1 s. */
-const PER_MIRROR_TIMEOUT_MS  = 3_500;
-/** How long a misbehaving mirror stays out of rotation. */
-const MIRROR_BLACKLIST_MS    = 5 * 60 * 1_000; // 5 minutes
+// ── Bulk pool (viewport queries) ──────────────────────────────────────────────
+const BULK_PER_MIRROR_MS  = 6_000;
+const BULK_BLACKLIST_MS   = 5 * 60_000;
+const bulkFailed          = new Map<string, number>();
+let   bulkFastest: string | null = null;
+let   bulkFastestMs              = Infinity;
 
-// Module-level state — both survive across calls within the same JS session.
-/** url → Unix-ms timestamp when the blacklist expires. */
-const failedMirrors = new Map<string, number>();
-/** The mirror that responded fastest in any previous call; tried first next time. */
-let fastestMirror: string | null = null;
-let fastestTimeMs: number        = Infinity;
+// ── Geo pool (single-element / batched geometry) ──────────────────────────────
+const GEO_PER_MIRROR_MS   = 5_000;  // geometry queries are simple; 5 s is generous but avoids 8 s ANR
+const GEO_BLACKLIST_MS    = 10_000; // re-admit mirrors quickly — brief instability shouldn't lock for long
+const GEO_ALL_FAIL_COOLDOWN_MS = 10_000;
+const geoFailed           = new Map<string, number>();
+let   geoFastest: string | null = null;
+let   geoFastestMs               = Infinity;
+let   geoAllFailedUntil          = 0;        // global cooldown after total blackout
 
-/**
- * Executes an Overpass QL query with automatic mirror rotation.
- *
- * Selection order each call:
- *   1. Non-blacklisted mirrors, with the known-fastest mirror promoted to front.
- *   2. If every mirror is blacklisted the blacklist is fully reset first.
- *
- * A mirror is blacklisted for MIRROR_BLACKLIST_MS on:
- *   • HTTP 504 / 429 / 503
- *   • Client-side timeout (PER_MIRROR_TIMEOUT_MS elapsed)
- *   • Network / fetch error
- *
- * Non-transient HTTP errors (400, 404 …) propagate immediately without retry.
- * The caller's AbortSignal is forwarded so cancellation is always instant.
- */
+// ── Shared fetch helper ───────────────────────────────────────────────────────
+
+interface Pool {
+  failed:        Map<string, number>;
+  fastest:       string | null;
+  fastestMs:     number;
+  perMirrorMs:   number;
+  blacklistMs:   number;
+  setFastest:    (url: string, ms: number) => void;
+  addFailed:     (url: string, until: number) => void;
+}
+
+const BULK_POOL: Pool = {
+  failed:      bulkFailed,
+  get fastest()   { return bulkFastest;   },
+  get fastestMs() { return bulkFastestMs; },
+  perMirrorMs: BULK_PER_MIRROR_MS,
+  blacklistMs: BULK_BLACKLIST_MS,
+  setFastest:  (url, ms) => { bulkFastest = url; bulkFastestMs = ms; },
+  addFailed:   (url, until) => bulkFailed.set(url, until),
+};
+
+// ── Sequential fetch — used for heavy bulk viewport queries ──────────────────
+// Tries mirrors one-by-one so we don't hammer every server with a multi-second
+// scan simultaneously.
 async function fetchWithMirrors(
   query:       string,
+  pool:        Pool,
   userSignal?: AbortSignal,
 ): Promise<unknown> {
   const now = Date.now();
 
-  // Build candidate list: exclude currently-blacklisted mirrors
   let candidates = OVERPASS_MIRRORS.filter(
-    url => (failedMirrors.get(url) ?? 0) <= now,
+    url => (pool.failed.get(url) ?? 0) <= now,
   );
 
-  // Safety valve: if everything is blacklisted, reset and try all mirrors again
   if (candidates.length === 0) {
     console.warn('[overpassService] all mirrors blacklisted — resetting blacklist');
-    failedMirrors.clear();
+    pool.failed.clear();
     candidates = [...OVERPASS_MIRRORS];
   }
 
-  // Promote the empirically fastest mirror to index 0
-  if (fastestMirror && candidates.includes(fastestMirror) && candidates[0] !== fastestMirror) {
-    candidates = [fastestMirror, ...candidates.filter(u => u !== fastestMirror)];
+  const fastest = pool.fastest;
+  if (fastest && candidates.includes(fastest) && candidates[0] !== fastest) {
+    candidates = [fastest, ...candidates.filter(u => u !== fastest)];
   }
 
   const errors: string[] = [];
 
   for (const url of candidates) {
-    if (userSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (userSignal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
 
     const mirrorCtrl  = new AbortController();
-    const mirrorTimer = setTimeout(() => mirrorCtrl.abort(), PER_MIRROR_TIMEOUT_MS);
+    const mirrorTimer = setTimeout(() => mirrorCtrl.abort(), pool.perMirrorMs);
 
-    // Forward caller cancellation so in-flight fetches die immediately
     const forwardAbort = () => mirrorCtrl.abort();
     userSignal?.addEventListener('abort', forwardAbort);
 
@@ -117,24 +146,18 @@ async function fetchWithMirrors(
       if (res.ok) {
         const json    = await res.json();
         const elapsed = Date.now() - t0;
-        // Update fastest-mirror record
-        if (elapsed < fastestTimeMs) {
-          fastestTimeMs = elapsed;
-          fastestMirror = url;
-        }
+        if (elapsed < pool.fastestMs) pool.setFastest(url, elapsed);
         console.log(`[overpassService] ${host} OK in ${elapsed} ms`);
         return json;
       }
 
-      // Transient server trouble — blacklist and try the next mirror
       if (res.status === 504 || res.status === 429 || res.status === 503) {
-        failedMirrors.set(url, now + MIRROR_BLACKLIST_MS);
-        console.warn(`[overpassService] ${host} → HTTP ${res.status} — blacklisted 5 min`);
+        pool.addFailed(url, now + pool.blacklistMs);
+        console.warn(`[overpassService] ${host} → HTTP ${res.status} — blacklisted`);
         errors.push(`${host}:${res.status}`);
         continue;
       }
 
-      // Permanent error — propagate without retry
       throw new Error(`Overpass HTTP ${res.status}`);
 
     } catch (err) {
@@ -142,15 +165,14 @@ async function fetchWithMirrors(
       userSignal?.removeEventListener('abort', forwardAbort);
 
       if (err instanceof Error && err.name === 'AbortError') {
-        if (userSignal?.aborted) throw err;                      // propagate caller cancel
-        failedMirrors.set(url, now + MIRROR_BLACKLIST_MS);
-        console.warn(`[overpassService] ${host} → timeout — blacklisted 5 min`);
+        if (userSignal?.aborted) throw err;
+        pool.addFailed(url, now + pool.blacklistMs);
+        console.warn(`[overpassService] ${host} → timeout — blacklisted`);
         errors.push(`${host}:timeout`);
         continue;
       }
 
-      // Network / JSON parse error — blacklist and try next
-      failedMirrors.set(url, now + MIRROR_BLACKLIST_MS);
+      pool.addFailed(url, now + pool.blacklistMs);
       console.warn(`[overpassService] ${host} →`, err);
       errors.push(`${host}:err`);
     }
@@ -159,13 +181,100 @@ async function fetchWithMirrors(
   throw new Error(`All Overpass mirrors failed [${errors.join(' | ')}]`);
 }
 
+// ── Parallel fetch — used for lightweight geometry queries ───────────────────
+// Geometry queries normally complete in <1 s on a healthy mirror.  Racing all
+// candidates simultaneously means 3 instantly-dead mirrors don't add their
+// failure latency to the total — only the fastest successful response matters.
+// Sequential worst-case was GEO_PER_MIRROR_MS × N mirrors; parallel worst-case
+// is GEO_PER_MIRROR_MS (the single slowest mirror that wins the race).
+async function fetchGeoParallel(
+  query:       string,
+  userSignal?: AbortSignal,
+): Promise<unknown> {
+  const now = Date.now();
+
+  if (now < geoAllFailedUntil) {
+    throw new Error(
+      `All Overpass mirrors on cooldown — retry in ${Math.ceil((geoAllFailedUntil - now) / 1000)} s`,
+    );
+  }
+
+  let candidates = OVERPASS_MIRRORS.filter(url => (geoFailed.get(url) ?? 0) <= now);
+  if (candidates.length === 0) {
+    console.warn('[overpassService] all geo mirrors blacklisted — resetting');
+    geoFailed.clear();
+    candidates = [...OVERPASS_MIRRORS];
+  }
+
+  if (geoFastest && candidates.includes(geoFastest) && candidates[0] !== geoFastest) {
+    candidates = [geoFastest, ...candidates.filter(u => u !== geoFastest)];
+  }
+
+  // One AbortController per mirror so the winner can cancel the rest
+  const ctrls = candidates.map(() => new AbortController());
+
+  const cancelAll = () => ctrls.forEach(c => c.abort());
+  userSignal?.addEventListener('abort', cancelAll, { once: true });
+
+  const attempts = candidates.map((url, i) => {
+    const ctrl = ctrls[i];
+    const host = url.split('/')[2];
+    const t0   = Date.now();
+
+    const timer = setTimeout(() => {
+      geoFailed.set(url, now + GEO_BLACKLIST_MS);
+      console.warn(`[overpassService] ${host} → geo timeout — blacklisted`);
+      ctrl.abort();
+    }, GEO_PER_MIRROR_MS);
+
+    return fetch(`${url}?data=${encodeURIComponent(query)}`, { signal: ctrl.signal })
+      .then(async res => {
+        clearTimeout(timer);
+        if (!res.ok) {
+          if (res.status === 504 || res.status === 429 || res.status === 503) {
+            geoFailed.set(url, now + GEO_BLACKLIST_MS);
+          }
+          throw new Error(`${host}:${res.status}`);
+        }
+        const json    = await res.json();
+        const elapsed = Date.now() - t0;
+        if (elapsed < geoFastestMs) { geoFastest = url; geoFastestMs = elapsed; }
+        console.log(`[overpassService] ${host} OK in ${elapsed} ms`);
+        return json;
+      })
+      .catch(err => {
+        clearTimeout(timer);
+        if (!(err instanceof Error && err.name === 'AbortError')) {
+          geoFailed.set(url, now + GEO_BLACKLIST_MS);
+          console.warn(`[overpassService] ${host} →`, err);
+        }
+        throw err;
+      });
+  });
+
+  try {
+    const result = await Promise.any(attempts);
+    cancelAll();
+    userSignal?.removeEventListener('abort', cancelAll);
+    return result;
+  } catch {
+    userSignal?.removeEventListener('abort', cancelAll);
+    if (userSignal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    geoAllFailedUntil = now + GEO_ALL_FAIL_COOLDOWN_MS;
+    throw new Error('All Overpass geo mirrors failed');
+  }
+}
+
 // ─── Запрос ───────────────────────────────────────────────────────────────────
 
 export function buildOverpassQuery(
   south: number, west: number, north: number, east: number,
 ): string {
   const bbox = `${south},${west},${north},${east}`;
-  // out center — centroid only; no ring geometry. Fast, small payload.
+  // Lightweight bulk fetch — `out center` returns positions + tags only, so
+  // the viewport query stays fast and small even over wide areas. Full ring
+  // geometry for the handful of zones actually visible at close zoom is
+  // fetched separately and on demand — see fetchParkingGeometryBatch below.
   return `[out:json][timeout:10][maxsize:2000000];
 (
   node["amenity"="parking"](${bbox});
@@ -186,7 +295,7 @@ export async function fetchParkingData(
   signal?: AbortSignal,
 ): Promise<OsmParking[]> {
   const query = buildOverpassQuery(south, west, north, east);
-  const json  = await fetchWithMirrors(query, signal);
+  const json  = await fetchWithMirrors(query, BULK_POOL, signal);
   return parseOverpassData(json as { elements: unknown[] });
 }
 
@@ -304,7 +413,7 @@ export async function fetchParkingGeometry(
   // in < 1 s on a healthy mirror, so 15 s is generous but safe for slow ones.
   const query = `[out:json][timeout:15]; ${type}(${numId}); out geom;`;
 
-  const json = await fetchWithMirrors(query, signal);
+  const json = await fetchGeoParallel(query, signal);
   const el   = ((json as { elements: unknown[] }).elements as any[])[0];
   if (!el) return { polygon: null, polyline: null };
 
@@ -326,4 +435,54 @@ export async function fetchParkingGeometry(
     polygon:  coords.length >= 3 ? coords : null,
     polyline: null,
   };
+}
+
+// ─── Batched geometry fetch (zones visible at close zoom) ────────────────────
+// Bridges the gap left by the now-lightweight bulk query: once the camera is
+// close enough to show precise zone outlines, useMapParkings collects the ids
+// of the on-screen elements still missing geometry and fetches all of their
+// rings in ONE combined request — far cheaper than `out geom` over the whole
+// viewport, and far cheaper than fetchParkingGeometry called once per zone.
+// Nodes are excluded by the caller (single points — nothing to fetch).
+
+export async function fetchParkingGeometryBatch(
+  osmIds:  string[],        // e.g. ["w123456", "r987654", …] — no "n…" entries
+  signal?: AbortSignal,
+): Promise<Map<string, GeometryResult>> {
+  const result = new Map<string, GeometryResult>();
+
+  const wayIds      = osmIds.filter(id => id[0] === 'w').map(id => id.slice(1));
+  const relationIds = osmIds.filter(id => id[0] === 'r').map(id => id.slice(1));
+  if (wayIds.length === 0 && relationIds.length === 0) return result;
+
+  const parts: string[] = [];
+  if (wayIds.length)      parts.push(`way(id:${wayIds.join(',')});`);
+  if (relationIds.length) parts.push(`relation(id:${relationIds.join(',')});`);
+
+  // [timeout:20] — a batch covers a small, close-zoom viewport (a few dozen
+  // elements at most), so this still finishes well within the budget.
+  const query = `[out:json][timeout:20][maxsize:1000000];(${parts.join('')});out geom;`;
+  const json  = await fetchGeoParallel(query, signal);
+
+  for (const el of ((json as { elements: unknown[] }).elements as any[])) {
+    if (el.type === 'way') {
+      const coords = osmGeoToCoords(el.geometry ?? []);
+      const closed = isClosed(coords);
+      result.set(`w${el.id}`, {
+        polygon:  closed && coords.length >= 3 ? coords : null,
+        polyline: !closed && coords.length >= 2 ? coords : null,
+      });
+    } else if (el.type === 'relation') {
+      const outer  = (el.members ?? []).find(
+        (m: any) => m.type === 'way' && m.role === 'outer',
+      );
+      const coords = osmGeoToCoords(outer?.geometry ?? []);
+      result.set(`r${el.id}`, {
+        polygon:  coords.length >= 3 ? coords : null,
+        polyline: null,
+      });
+    }
+  }
+
+  return result;
 }

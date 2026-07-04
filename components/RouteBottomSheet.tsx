@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Animated, View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
+import { Animated, View, Text, TouchableOpacity, StyleSheet, Platform, Linking } from 'react-native';
 import { OsmParking, RouteInfo, LatLng } from '../types/parking';
 import { formatDistance, formatDuration, haversineDistance } from '../utils/geo';
 
@@ -14,7 +14,7 @@ interface Props {
   onClose:      () => void;
 }
 
-const SHEET_HEIGHT = 240;
+export const SHEET_HEIGHT = 240;
 const ACCENT       = '#007AFF';
 
 /** Имя парковки из OSM-тегов */
@@ -29,6 +29,27 @@ function parkingAddress(p: OsmParking): string | null {
   if (street && city) return `${street}, ${city}`;
   if (street) return street;
   return null;
+}
+
+// Without a Directions key, MAPS_APIKEY is '' — the in-app route preview
+// (polyline + ETA card) simply can't run. Telling the *driver* to go edit a
+// source file is a dead end, not a feature; what they actually want is
+// "take me there", and every phone already has a navigation app that does
+// that better than an in-app polyline ever could (live traffic, voice
+// guidance, lane assist). So this is the real "Go" for everyone — opening
+// the device's own maps app needs no key and always works. The in-app
+// preview above only supplements it on the rare device where a key exists.
+function openExternalNavigation(destination: LatLng, label: string): void {
+  const { latitude, longitude } = destination;
+  const place    = encodeURIComponent(label);
+  const url      = Platform.OS === 'ios'
+    ? `maps://app?daddr=${latitude},${longitude}&q=${place}`
+    : `geo:${latitude},${longitude}?q=${latitude},${longitude}(${place})`;
+  const fallback = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}&travelmode=driving`;
+
+  Linking.canOpenURL(url)
+    .then(supported => Linking.openURL(supported ? url : fallback))
+    .catch(() => Linking.openURL(fallback));
 }
 
 /** Примечание: тип / платность из OSM-тегов */
@@ -85,6 +106,9 @@ export const RouteBottomSheet: React.FC<Props> = ({
                   📍 {parkingAddress(parking)}
                 </Text>
               )}
+              <Text style={styles.coords} numberOfLines={1}>
+                {parking.position.latitude.toFixed(6)}, {parking.position.longitude.toFixed(6)}
+              </Text>
               {parkingNote(parking) && (
                 <Text style={styles.meta} numberOfLines={1}>
                   💡 {parkingNote(parking)}
@@ -96,21 +120,32 @@ export const RouteBottomSheet: React.FC<Props> = ({
                 </Text>
               )}
 
-              {hasApiKey ? (
+              <View style={styles.actionsRow}>
+                {hasApiKey && (
+                  <TouchableOpacity
+                    style={[styles.routeBtn, styles.routeBtnFlex, { backgroundColor: ACCENT }]}
+                    onPress={onStartRoute}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={styles.routeBtnText}>Поехали</Text>
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity
-                  style={[styles.routeBtn, { backgroundColor: ACCENT }]}
-                  onPress={onStartRoute}
+                  style={[
+                    styles.routeBtn,
+                    styles.routeBtnFlex,
+                    hasApiKey
+                      ? { backgroundColor: '#EFF6FF', borderWidth: 1, borderColor: '#BFDBFE' }
+                      : { backgroundColor: ACCENT },
+                  ]}
+                  onPress={() => openExternalNavigation(parking.position, parkingName(parking))}
                   activeOpacity={0.85}
                 >
-                  <Text style={styles.routeBtnText}>🗺 Проложить маршрут</Text>
-                </TouchableOpacity>
-              ) : (
-                <View style={styles.noKeyBox}>
-                  <Text style={styles.noKeyText}>
-                    Для навигации вставьте Google Maps API ключ в constants/maps.ts
+                  <Text style={hasApiKey ? styles.routeBtnTextSecondary : styles.routeBtnText}>
+                    🧭 Открыть в навигаторе
                   </Text>
-                </View>
-              )}
+                </TouchableOpacity>
+              </View>
             </>
           ) : (
             <>
@@ -171,11 +206,13 @@ const styles = StyleSheet.create({
   title:     { flex: 1, fontSize: 16, fontWeight: '700', color: '#111827' },
   closeIcon: { fontSize: 16, color: '#9CA3AF', paddingLeft: 8 },
   meta:      { fontSize: 13, color: '#6B7280', marginBottom: 3 },
+  coords:    { fontSize: 12, color: '#9CA3AF', marginBottom: 6 },
   distance:  { fontSize: 13, color: '#374151', fontWeight: '600', marginBottom: 10 },
-  routeBtn:  { borderRadius: 16, paddingVertical: 14, alignItems: 'center', marginTop: 4 },
+  actionsRow: { flexDirection: 'row', gap: 10, marginTop: 4 },
+  routeBtn:  { borderRadius: 16, paddingVertical: 14, alignItems: 'center' },
+  routeBtnFlex: { flex: 1 },
   routeBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  noKeyBox:  { backgroundColor: '#FEF9C3', borderRadius: 12, padding: 12, marginTop: 8 },
-  noKeyText: { fontSize: 12, color: '#92400E', textAlign: 'center' },
+  routeBtnTextSecondary: { color: ACCENT, fontSize: 15, fontWeight: '700' },
   etaRow: {
     flexDirection: 'row', justifyContent: 'center',
     alignItems: 'center', marginBottom: 14, marginTop: 4,

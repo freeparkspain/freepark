@@ -1,4 +1,4 @@
-import { LatLng } from '../types/parking';
+import { LatLng, BBox } from '../types/parking';
 
 const R = 6_371_000; // радиус Земли в метрах
 
@@ -23,6 +23,38 @@ export const haversineDistance = (a: LatLng, b: LatLng): number => {
     sinLat * sinLat +
     Math.cos(toRad(a.latitude)) * Math.cos(toRad(b.latitude)) * sinLon * sinLon;
   return R * 2 * Math.atan2(Math.sqrt(chord), Math.sqrt(1 - chord));
+};
+
+/**
+ * Approximate radius (in meters) of the visible map viewport — the distance
+ * from its center to a corner (half the diagonal). Used to decide whether the
+ * camera is zoomed in enough to render park-area polygons and markers.
+ */
+export const viewportRadiusMeters = (bbox: BBox): number => {
+  const center: LatLng = {
+    latitude:  (bbox.north + bbox.south) / 2,
+    longitude: (bbox.east  + bbox.west)  / 2,
+  };
+  return haversineDistance(center, { latitude: bbox.north, longitude: bbox.east });
+};
+
+/**
+ * The longest single edge of a ring, as a 2-point segment.
+ *
+ * Park-area polygons are mostly long, narrow bays hugging a road — tracing
+ * their full rectangular outline reads as a "box" rather than a parking
+ * stripe. Their longest edge runs along the road and alone approximates the
+ * bay's orientation and extent, giving a simple preview *line* instead.
+ */
+export const longestEdge = (coords: LatLng[]): [LatLng, LatLng] | null => {
+  if (coords.length < 2) return null;
+  let best: [LatLng, LatLng] | null = null;
+  let bestLen = -Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const len = haversineDistance(coords[i], coords[i + 1]);
+    if (len > bestLen) { bestLen = len; best = [coords[i], coords[i + 1]]; }
+  }
+  return best;
 };
 
 // ─── Polygon simplification (Ramer-Douglas-Peucker) ─────────────────────────
