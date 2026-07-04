@@ -16,7 +16,8 @@
       "Bash(curl -s --max-time 5 \"https://nominatim.openstreetmap.org/search?q=malaga&format=json&limit=1&email=freepark.spain@gmail.com\" -o /dev/null -w \"%{http_code}\")",
       "Bash(curl -s --max-time 5 \"https://photon.komoot.io/api/?q=malaga&limit=1\" -o /dev/null -w \"%{http_code}\")",
       "Bash(npx tsc *)",
-      "Bash(npx --yes tsc --noEmit)"
+      "Bash(npx --yes tsc --noEmit)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }
