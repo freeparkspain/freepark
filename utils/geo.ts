@@ -82,14 +82,12 @@ export const simplifyCoords = (coords: LatLng[], toleranceMeters = 2): LatLng[] 
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
 
-/** "1.2 км" / "800 м" */
 export const formatDistance = (km: number): string =>
-  km < 1 ? `${Math.round(km * 1000)} м` : `${km.toFixed(1)} км`;
+  km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
 
-/** "4 мин" / "1 ч 12 мин" */
 export const formatDuration = (minutes: number): string => {
-  if (minutes < 60) return `${Math.round(minutes)} мин`;
+  if (minutes < 60) return `${Math.round(minutes)} min`;
   const h = Math.floor(minutes / 60);
   const m = Math.round(minutes % 60);
-  return m > 0 ? `${h} ч ${m} мин` : `${h} ч`;
+  return m > 0 ? `${h} h ${m} min` : `${h} h`;
 };

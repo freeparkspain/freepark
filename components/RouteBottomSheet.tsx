@@ -1,78 +1,86 @@
 import React, { useEffect, useRef } from 'react';
-import { Animated, View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
-import { OsmParking, RouteInfo, LatLng } from '../types/parking';
+import {
+  Animated, Linking, Platform, StyleSheet,
+  Text, TouchableOpacity, View,
+} from 'react-native';
+import { SelectedDestination, RouteInfo, LatLng } from '../types/parking';
 import { formatDistance, formatDuration, haversineDistance } from '../utils/geo';
 
 interface Props {
-  parking:      OsmParking | null;
-  activeRoute:  boolean;
-  routeInfo:    RouteInfo | null;
-  userLocation: LatLng | null;
-  hasApiKey:    boolean;
-  onStartRoute: () => void;
+  destination:   SelectedDestination | null;
+  activeRoute:   boolean;
+  routeInfo:     RouteInfo | null;
+  userLocation:  LatLng | null;
+  canNavigate:   boolean;
+  routeError:    string | null;
+  onStartRoute:  () => void;
   onCancelRoute: () => void;
-  onClose:      () => void;
+  onClose:       () => void;
 }
 
-const SHEET_HEIGHT = 240;
+const SHEET_HEIGHT = 280;
 const ACCENT       = '#007AFF';
 
-/** Имя парковки из OSM-тегов */
-function parkingName(p: OsmParking): string {
-  return p.tags.name ?? p.tags['name:ru'] ?? p.tags['name:en'] ?? 'Парковка';
+function openInGoogleMaps(position: LatLng): void {
+  const { latitude, longitude } = position;
+  const nativeUrl = Platform.select({
+    ios:     `comgooglemaps://?daddr=${latitude},${longitude}&directionsmode=driving`,
+    android: `google.navigation:q=${latitude},${longitude}&mode=d`,
+  });
+  const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}&travelmode=driving`;
+  if (nativeUrl) {
+    Linking.canOpenURL(nativeUrl)
+      .then(ok => Linking.openURL(ok ? nativeUrl : webUrl))
+      .catch(() => Linking.openURL(webUrl));
+  } else {
+    Linking.openURL(webUrl);
+  }
 }
 
-/** Адрес из OSM-тегов */
-function parkingAddress(p: OsmParking): string | null {
-  const street = p.tags['addr:street'];
-  const city   = p.tags['addr:city'];
-  if (street && city) return `${street}, ${city}`;
-  if (street) return street;
-  return null;
-}
-
-/** Примечание: тип / платность из OSM-тегов */
-function parkingNote(p: OsmParking): string | null {
-  const parts: string[] = [];
-  if (p.tags.fee === 'yes')  parts.push('Платная');
-  if (p.tags.fee === 'no')   parts.push('Бесплатная');
-  if (p.tags.capacity)       parts.push(`Мест: ${p.tags.capacity}`);
-  if (p.tags.maxstay)        parts.push(`Макс: ${p.tags.maxstay}`);
-  return parts.length ? parts.join(' · ') : null;
-}
+const TYPE_ICON: Record<SelectedDestination['type'], string> = {
+  parking: '🅿️',
+  search:  '🔍',
+  pin:     '📍',
+};
 
 export const RouteBottomSheet: React.FC<Props> = ({
-  parking, activeRoute, routeInfo, userLocation, hasApiKey,
+  destination, activeRoute, routeInfo, userLocation, canNavigate, routeError,
   onStartRoute, onCancelRoute, onClose,
 }) => {
   const translateY = useRef(new Animated.Value(SHEET_HEIGHT)).current;
 
   useEffect(() => {
     Animated.spring(translateY, {
-      toValue:         parking ? 0 : SHEET_HEIGHT,
+      toValue:         destination ? 0 : SHEET_HEIGHT,
       friction:        9,
       tension:         120,
       useNativeDriver: true,
     }).start();
-  }, [parking, translateY]);
+  }, [destination, translateY]);
 
-  const straightDist = parking && userLocation
-    ? haversineDistance(userLocation, parking.position)
+  const straightDist = destination && userLocation
+    ? haversineDistance(userLocation, destination.position)
     : null;
+
+  const startDisabled = !canNavigate || !userLocation;
+  const startLabel    = !userLocation
+    ? '📍 Waiting for location…'
+    : !canNavigate
+    ? '⚙️ No route provider configured'
+    : '🗺 Start Route';
 
   return (
     <Animated.View
       style={[styles.sheet, { transform: [{ translateY }] }]}
-      pointerEvents={parking ? 'box-none' : 'none'}
+      pointerEvents={destination ? 'box-none' : 'none'}
     >
-      {parking && (
+      {destination && (
         <>
           <View style={styles.handle} />
 
-          {/* Header */}
           <View style={styles.header}>
-            <View style={[styles.dot, { backgroundColor: ACCENT }]} />
-            <Text style={styles.title} numberOfLines={1}>{parkingName(parking)}</Text>
+            <Text style={styles.typeIcon}>{TYPE_ICON[destination.type]}</Text>
+            <Text style={styles.title} numberOfLines={1}>{destination.title}</Text>
             <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
               <Text style={styles.closeIcon}>✕</Text>
             </TouchableOpacity>
@@ -80,57 +88,59 @@ export const RouteBottomSheet: React.FC<Props> = ({
 
           {!activeRoute ? (
             <>
-              {parkingAddress(parking) && (
-                <Text style={styles.meta} numberOfLines={1}>
-                  📍 {parkingAddress(parking)}
-                </Text>
-              )}
-              {parkingNote(parking) && (
-                <Text style={styles.meta} numberOfLines={1}>
-                  💡 {parkingNote(parking)}
-                </Text>
-              )}
               {straightDist !== null && (
                 <Text style={styles.distance}>
-                  {formatDistance(straightDist / 1000)}
+                  {formatDistance(straightDist / 1000)} straight line
                 </Text>
               )}
 
-              {hasApiKey ? (
-                <TouchableOpacity
-                  style={[styles.routeBtn, { backgroundColor: ACCENT }]}
-                  onPress={onStartRoute}
-                  activeOpacity={0.85}
-                >
-                  <Text style={styles.routeBtnText}>🗺 Проложить маршрут</Text>
-                </TouchableOpacity>
-              ) : (
-                <View style={styles.noKeyBox}>
-                  <Text style={styles.noKeyText}>
-                    Для навигации вставьте Google Maps API ключ в constants/maps.ts
-                  </Text>
-                </View>
-              )}
+              <TouchableOpacity
+                style={[styles.routeBtn, { backgroundColor: startDisabled ? '#9CA3AF' : ACCENT }]}
+                onPress={startDisabled ? undefined : onStartRoute}
+                activeOpacity={startDisabled ? 1 : 0.85}
+                disabled={startDisabled}
+              >
+                <Text style={styles.routeBtnText}>{startLabel}</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.gmapsBtn}
+                onPress={() => openInGoogleMaps(destination.position)}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.gmapsBtnText}>🗺 Open in Google Maps</Text>
+              </TouchableOpacity>
             </>
           ) : (
             <>
-              {routeInfo ? (
+              {routeError ? (
+                <Text style={styles.errorText}>⚠️ Route unavailable · showing direct line</Text>
+              ) : routeInfo ? (
                 <View style={styles.etaRow}>
                   <View style={styles.etaCard}>
                     <Text style={styles.etaValue}>{formatDistance(routeInfo.distance)}</Text>
-                    <Text style={styles.etaLabel}>расстояние</Text>
+                    <Text style={styles.etaLabel}>distance</Text>
                   </View>
                   <View style={styles.etaSep} />
                   <View style={styles.etaCard}>
                     <Text style={styles.etaValue}>{formatDuration(routeInfo.duration)}</Text>
-                    <Text style={styles.etaLabel}>время в пути</Text>
+                    <Text style={styles.etaLabel}>travel time</Text>
                   </View>
                 </View>
               ) : (
-                <Text style={styles.calculating}>⏳ Строим маршрут…</Text>
+                <Text style={styles.calculating}>⏳ Calculating route…</Text>
               )}
+
               <TouchableOpacity style={styles.cancelBtn} onPress={onCancelRoute} activeOpacity={0.85}>
-                <Text style={styles.cancelBtnText}>✕  Отменить маршрут</Text>
+                <Text style={styles.cancelBtnText}>✕  Cancel Route</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.gmapsBtn, { marginTop: 8 }]}
+                onPress={() => openInGoogleMaps(destination.position)}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.gmapsBtnText}>🗺 Open in Google Maps</Text>
               </TouchableOpacity>
             </>
           )}
@@ -161,30 +171,36 @@ const styles = StyleSheet.create({
     width: 44, height: 5, borderRadius: 3,
     backgroundColor: '#E5E7EB',
     alignSelf: 'center',
-    marginTop: 10, marginBottom: 14,
+    marginTop: 10, marginBottom: 12,
   },
   header: {
     flexDirection: 'row', alignItems: 'center',
-    gap: 10, marginBottom: 6,
+    gap: 8, marginBottom: 6,
   },
-  dot:       { width: 12, height: 12, borderRadius: 6, flexShrink: 0 },
-  title:     { flex: 1, fontSize: 16, fontWeight: '700', color: '#111827' },
+  typeIcon:  { fontSize: 16 },
+  title:     { flex: 1, fontSize: 15, fontWeight: '700', color: '#111827' },
   closeIcon: { fontSize: 16, color: '#9CA3AF', paddingLeft: 8 },
-  meta:      { fontSize: 13, color: '#6B7280', marginBottom: 3 },
-  distance:  { fontSize: 13, color: '#374151', fontWeight: '600', marginBottom: 10 },
-  routeBtn:  { borderRadius: 16, paddingVertical: 14, alignItems: 'center', marginTop: 4 },
+  distance:  { fontSize: 13, color: '#6B7280', marginBottom: 10 },
+  routeBtn:  { borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginBottom: 8 },
   routeBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  noKeyBox:  { backgroundColor: '#FEF9C3', borderRadius: 12, padding: 12, marginTop: 8 },
-  noKeyText: { fontSize: 12, color: '#92400E', textAlign: 'center' },
+  gmapsBtn: {
+    borderRadius: 14, paddingVertical: 11,
+    alignItems: 'center', borderWidth: 1.5, borderColor: '#34A853',
+  },
+  gmapsBtnText: { color: '#34A853', fontSize: 14, fontWeight: '600' },
+  errorText: {
+    fontSize: 13, color: '#92400E', textAlign: 'center',
+    backgroundColor: '#FEF9C3', borderRadius: 8, padding: 8, marginBottom: 10,
+  },
   etaRow: {
     flexDirection: 'row', justifyContent: 'center',
-    alignItems: 'center', marginBottom: 14, marginTop: 4,
+    alignItems: 'center', marginBottom: 10, marginTop: 2,
   },
   etaCard:      { flex: 1, alignItems: 'center' },
-  etaSep:       { width: 1, height: 40, backgroundColor: '#E5E7EB' },
-  etaValue:     { fontSize: 22, fontWeight: '800', color: '#111827' },
+  etaSep:       { width: 1, height: 38, backgroundColor: '#E5E7EB' },
+  etaValue:     { fontSize: 21, fontWeight: '800', color: '#111827' },
   etaLabel:     { fontSize: 11, color: '#9CA3AF', marginTop: 2 },
-  calculating:  { fontSize: 14, color: '#9CA3AF', textAlign: 'center', marginVertical: 12 },
-  cancelBtn:    { backgroundColor: '#FEE2E2', borderRadius: 16, paddingVertical: 14, alignItems: 'center' },
+  calculating:  { fontSize: 14, color: '#9CA3AF', textAlign: 'center', marginVertical: 10 },
+  cancelBtn:    { backgroundColor: '#FEE2E2', borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginBottom: 8 },
   cancelBtnText:{ color: '#DC2626', fontSize: 15, fontWeight: '700' },
 });

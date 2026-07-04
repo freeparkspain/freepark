@@ -1,11 +1,11 @@
-// Вставьте сюда ключ Google Maps Directions API.
-// Нужен только для построения маршрутов — OSM-тайлы и маркеры работают без него.
-// Получить: https://console.cloud.google.com/ → Directions API
-export const MAPS_APIKEY = '';
+export const MAPS_APIKEY: string =
+  process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
-// Цвета линий по типу парковки (стиль Mapy.cz / Google Maps)
+export const NAVIGATION_PROVIDER: "google" | "osrm" =
+  process.env.EXPO_PUBLIC_NAVIGATION_PROVIDER === "osrm" ? "osrm" : "google";
+
 export const PARKING_STROKE: Record<string, string> = {
-  free:    '#4285F4',  // синий — бесплатная
-  paid:    '#EF4444',  // красный — платная
-  unknown: '#6B7280',  // серый — неизвестно
+  free: "#4285F4",
+  paid: "#EF4444",
+  unknown: "#6B7280",
 };
