@@ -1,4 +1,3 @@
-// npm install babel-preset-expo --save-dev
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   View,
@@ -19,27 +18,22 @@ import MapView, {
   LongPressEvent,
   Region,
 } from "react-native-maps";
-import { useNavigation } from "@react-navigation/native";
-import { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import * as Location from "expo-location";
 import MapViewDirections from "react-native-maps-directions";
 
-import { SpotMarker } from "../components/SpotMarker";
 import { FilterToggle } from "../components/FilterToggle";
-import { MapLegend } from "../components/MapLegend";
 import { SearchBar } from "../components/SearchBar";
 import { ParkingLayer } from "../components/ParkingLayer";
 import { LoadingOverlay } from "../components/LoadingOverlay";
 import { GeometryLoadingBar } from "../components/GeometryLoadingBar";
-import { RouteBottomSheet } from "../components/RouteBottomSheet";
-import { useParkingStore, useFilteredSpots } from "../store/useParkingStore";
+import { RouteBottomSheet, SHEET_HEIGHT } from "../components/RouteBottomSheet";
+import { NearbyParkingSuggestion } from "../components/NearbyParkingSuggestion";
 import { useMapParkings } from "../hooks/useMapParkings";
 import { useGeometryLoader } from "../hooks/useGeometryLoader";
-import { OsmParking, LatLng, BBox, RouteInfo, RootStackParamList, SelectedDestination } from "../types/parking";
+import { OsmParking, LatLng, BBox, RouteInfo, SelectedDestination } from "../types/parking";
 import { MAPS_APIKEY, NAVIGATION_PROVIDER } from "../constants/maps";
 import { fetchOsrmRoute } from "../services/navigation/osrmNavigation";
-
-type MapNav = NativeStackNavigationProp<RootStackParamList, "Map">;
+import { viewportRadiusMeters, haversineDistance } from "../utils/geo";
 
 export const MALAGA_REGION = {
   latitude: 36.7213,
@@ -48,9 +42,13 @@ export const MALAGA_REGION = {
   longitudeDelta: 0.06,
 };
 
-// Default vertical offset (from the bottom of the screen) for the recenter button.
-// Lowered so the button sits near the bottom; it lifts above the keyboard when open.
-const RECENTER_BOTTOM_DEFAULT = 40;
+const RECENTER_BOTTOM_DEFAULT    = 40;
+const RECENTER_LIFT_MARGIN       = 12;
+const PARK_AREA_RADIUS_LIMIT_M   = 2_000;
+const AUTO_LOAD_MOVE_THRESHOLD_M = 1_200;
+const AUTO_LOAD_DELTA            = 0.03;
+const NEARBY_SUGGESTION_RADIUS_M = 1_500;
+const SUGGESTION_RECOMPUTE_THRESHOLD_M = 80;
 
 function regionToBBox(r: Region): BBox {
   return {
@@ -62,12 +60,8 @@ function regionToBBox(r: Region): BBox {
 }
 
 export const MapScreen: React.FC = () => {
-  const navigation = useNavigation<MapNav>();
-  const { setSelectedSpot } = useParkingStore();
-  const filteredSpots = useFilteredSpots();
-
   // ── OSM parking zone hooks ───────────────────────────────────────────────────
-  const { parkings, loading, loadForRegion } = useMapParkings();
+  const { parkings, loading, loadForRegion, loadZoneGeometry } = useMapParkings();
   const { geometry, geometryLoading, loadGeometry, clearGeometry } = useGeometryLoader();
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
@@ -79,7 +73,24 @@ export const MapScreen: React.FC = () => {
   const markerJustTappedRef = useRef(false);
   // Prevents multiple rapid taps from queuing simultaneous geometry fetches.
   const isProcessingRef     = useRef(false);
-  const regionDebounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True while the user has an active pinch/pan gesture on the map (set on
+  // every onRegionChange tick, cleared once onRegionChangeComplete fires).
+  // Letting an icon tap through mid-gesture races the native bridge and can
+  // crash the app outright on Android. Swallowing taps until the gesture
+  // actually settles closes that window.
+  const isGesturingRef      = useRef(false);
+  // Timer that clears isGesturingRef 100 ms after the gesture ends — this
+  // post-settle buffer prevents the iOS crash where onRegionChangeComplete
+  // fires while the finger is still lifting (the native layer finishes the
+  // animation asynchronously).
+  const gestureSettleTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mirror of viewportBounds held as a ref so handlePressCluster can read the
+  // latest value without having viewportBounds in its deps — keeping the
+  // callback reference stable prevents all ClusterMarker components from
+  // re-rendering on every pan event.
+  const viewportBoundsRef   = useRef<BBox>(regionToBBox(MALAGA_REGION));
+  // Centre of the last auto-load triggered by the driver's own movement.
+  const lastAutoLoadCenter  = useRef<LatLng | null>(null);
   const osrmFetchIdRef      = useRef(0);
 
   // ── Search / long-press pin state ────────────────────────────────────────────
@@ -100,22 +111,42 @@ export const MapScreen: React.FC = () => {
   // ── OSM parking zone state ────────────────────────────────────────────────────
   const [latDelta,          setLatDelta]          = useState(MALAGA_REGION.latitudeDelta);
   const [viewportBounds,    setViewportBounds]    = useState<BBox>(() => regionToBBox(MALAGA_REGION));
-  const [selectedParkingId, setSelectedParkingId] = useState<string | null>(null);
-  const [activeRoute,       setActiveRoute]       = useState(false);
-  const [routeInfo,         setRouteInfo]         = useState<RouteInfo | null>(null);
-  const [routeError,        setRouteError]        = useState<string | null>(null);
-  const [osrmPolyline,      setOsrmPolyline]      = useState<LatLng[] | null>(null);
+  // Keep the ref in sync so handlePressCluster can read the current bounds
+  // without capturing viewportBounds in its deps (which would recreate the
+  // callback — and re-render every ClusterMarker — on every pan event).
+  viewportBoundsRef.current = viewportBounds;
+  const [selectedParkingId,   setSelectedParkingId]   = useState<string | null>(null);
+  const [activeRoute,         setActiveRoute]         = useState(false);
+  const [routeInfo,           setRouteInfo]           = useState<RouteInfo | null>(null);
+  const [routeError,          setRouteError]          = useState<string | null>(null);
+  const [osrmPolyline,        setOsrmPolyline]        = useState<LatLng[] | null>(null);
   const [selectedDestination, setSelectedDestination] = useState<SelectedDestination | null>(null);
-  const [userLocation,      setUserLocation]      = useState<LatLng | null>(null);
+  const [userLocation,        setUserLocation]        = useState<LatLng | null>(null);
+
+  // Closest known parking area to the driver — see the throttled scan effect below.
+  const [nearestParking, setNearestParking] = useState<{
+    parking:        OsmParking;
+    distanceMeters: number;
+  } | null>(null);
+  const suggestionScanRef = useRef<{ at: LatLng; parkings: OsmParking[] } | null>(null);
 
   // ── Keyboard state ─────────────────────────────────────────────────────────────
-  // Tracks the on-screen keyboard height so the recenter button can lift above it.
   const [keyboardHeight, setKeyboardHeight] = useState(0);
 
   const canNavigate = NAVIGATION_PROVIDER === 'osrm' || MAPS_APIKEY.length > 0;
 
+  const showZonePolygons = viewportRadiusMeters(viewportBounds) <= PARK_AREA_RADIUS_LIMIT_M;
+
+  const recenterLift = Math.max(
+    keyboardHeight      > 0 ? keyboardHeight   + RECENTER_LIFT_MARGIN : 0,
+    selectedDestination     ? SHEET_HEIGHT     + RECENTER_LIFT_MARGIN : 0,
+  );
+  const recenterBottom = recenterLift > 0 ? recenterLift : RECENTER_BOTTOM_DEFAULT;
+
+  const showNearbySuggestion =
+    !!nearestParking && !selectedDestination && !searchPin && !droppedPin && keyboardHeight === 0;
+
   // ── Effects ───────────────────────────────────────────────────────────────────
-  // Auto-show callout after dropped pin finishes reverse-geocoding
   useEffect(() => {
     if (droppedPin && !droppedPin.loading) {
       const t = setTimeout(() => droppedMarkerRef.current?.showCallout(), 400);
@@ -123,7 +154,6 @@ export const MapScreen: React.FC = () => {
     }
   }, [droppedPin?.id, droppedPin?.loading]);
 
-  // Auto-show callout for search result pin
   useEffect(() => {
     if (searchPin) {
       const t = setTimeout(() => searchMarkerRef.current?.showCallout(), 500);
@@ -146,20 +176,68 @@ export const MapScreen: React.FC = () => {
     return () => { sub?.remove(); };
   }, []);
 
+  // Driving aid: load parking data around the driver, not just the viewport.
+  useEffect(() => {
+    if (!userLocation) return;
+    const last = lastAutoLoadCenter.current;
+    if (last && haversineDistance(last, userLocation) < AUTO_LOAD_MOVE_THRESHOLD_M) return;
+    lastAutoLoadCenter.current = userLocation;
+    loadForRegion({
+      latitude:       userLocation.latitude,
+      longitude:      userLocation.longitude,
+      latitudeDelta:  AUTO_LOAD_DELTA,
+      longitudeDelta: AUTO_LOAD_DELTA,
+    });
+  }, [userLocation, loadForRegion]);
+
+  // Driving aid: throttled "nearest parking" scan.
+  useEffect(() => {
+    if (!userLocation) {
+      suggestionScanRef.current = null;
+      setNearestParking(null);
+      return;
+    }
+
+    const prev        = suggestionScanRef.current;
+    const movedEnough = !prev || haversineDistance(prev.at, userLocation) >= SUGGESTION_RECOMPUTE_THRESHOLD_M;
+    const dataChanged = !prev || prev.parkings !== parkings;
+    if (!movedEnough && !dataChanged) return;
+
+    suggestionScanRef.current = { at: userLocation, parkings };
+
+    let best: OsmParking | null = null;
+    let bestDist = Infinity;
+    for (const p of parkings) {
+      const d = haversineDistance(userLocation, p.position);
+      if (d < bestDist) { bestDist = d; best = p; }
+    }
+    setNearestParking(
+      best && bestDist <= NEARBY_SUGGESTION_RADIUS_M
+        ? { parking: best, distanceMeters: bestDist }
+        : null,
+    );
+  }, [userLocation, parkings]);
+
   // Trigger initial OSM parking zone load (onRegionChangeComplete may not fire on first render)
   useEffect(() => {
     loadForRegion(MALAGA_REGION);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Debounce timer cleanup
+  // Once the camera is close enough to show zone outlines, fetch full ring geometry
+  // for the on-screen zones that don't have it yet — in one batched request.
   useEffect(() => {
-    return () => {
-      if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
-    };
-  }, []);
+    if (!showZonePolygons) return;
+    const visibleIds = parkings
+      .filter(p =>
+        !p.polygon && !p.polyline &&
+        p.position.latitude  >= viewportBounds.south && p.position.latitude  <= viewportBounds.north &&
+        p.position.longitude >= viewportBounds.west  && p.position.longitude <= viewportBounds.east,
+      )
+      .map(p => p.id);
+    if (visibleIds.length) loadZoneGeometry(visibleIds);
+  }, [showZonePolygons, parkings, viewportBounds, loadZoneGeometry]);
 
-  // Keyboard listeners: lift the recenter button above the keyboard while it is open,
-  // and return it to its default lower position when the keyboard is dismissed.
+  // Keyboard listeners: lift the recenter button above the keyboard while it is open.
   useEffect(() => {
     const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
     const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
@@ -176,18 +254,25 @@ export const MapScreen: React.FC = () => {
   }, []);
 
   // ── Map event handlers ────────────────────────────────────────────────────────
-  // Debounced: updates viewport state and triggers OSM zone fetch on pan/zoom
   const handleRegionChangeComplete = useCallback((region: Region) => {
-    if (regionDebounceTimer.current) clearTimeout(regionDebounceTimer.current);
-    regionDebounceTimer.current = setTimeout(() => {
-      setLatDelta(region.latitudeDelta);
-      setViewportBounds(regionToBBox(region));
-      loadForRegion(region);
-    }, 500);
+    // 100 ms post-settle buffer: on iOS, onRegionChangeComplete fires while
+    // the native animation is still winding down. Clearing isGesturingRef
+    // immediately lets a marker tap race the bridge's cleanup and crash the app.
+    if (gestureSettleTimer.current) clearTimeout(gestureSettleTimer.current);
+    gestureSettleTimer.current = setTimeout(() => {
+      isGesturingRef.current = false;
+    }, 100);
+    setLatDelta(region.latitudeDelta);
+    setViewportBounds(regionToBBox(region));
+    loadForRegion(region);
   }, [loadForRegion]);
 
-  // Map tap: clears search/dropped pins AND deselects any OSM parking zone.
-  // markerJustTappedRef guard prevents iOS double-fire (Marker.onPress + MapView.onPress).
+  // Marks the gesture as "in flight" on every frame the camera moves.
+  const handleRegionChange = useCallback(() => {
+    isGesturingRef.current = true;
+  }, []);
+
+  // Map tap: clears all selections and route state.
   const handleMapPress = useCallback(() => {
     if (markerJustTappedRef.current) return;
     setDroppedPin(null);
@@ -201,16 +286,16 @@ export const MapScreen: React.FC = () => {
     clearGeometry();
   }, [clearGeometry]);
 
-  // Long-press: drops a pin, sets it as navigation destination, reverse-geocodes address
+  // Long-press: drops a pin, sets it as navigation destination, reverse-geocodes address.
   const handleLongPress = useCallback(async (e: LongPressEvent) => {
     setSearchPin(null);
     setSelectedParkingId(null);
     clearGeometry();
 
     const { latitude, longitude } = e.nativeEvent.coordinate;
-    const newId    = Date.now();
-    const pinId    = `pin-${newId}`;
-    const position = { latitude, longitude };
+    const newId      = Date.now();
+    const pinId      = `pin-${newId}`;
+    const position   = { latitude, longitude };
     const coordTitle = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
 
     console.log('[MapScreen] long-press pin placed at:', coordTitle);
@@ -221,9 +306,6 @@ export const MapScreen: React.FC = () => {
     setRouteInfo(null);
     setRouteError(null);
     setOsrmPolyline(null);
-
-    console.log('[MapScreen] selectedDestination set (pin):', coordTitle);
-    console.log('[MapScreen] navigation sheet opening for dropped pin');
 
     try {
       const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
@@ -244,7 +326,7 @@ export const MapScreen: React.FC = () => {
     }
   }, [clearGeometry]);
 
-  // Search result selected: places a pin, sets navigation destination, animates camera
+  // Search result selected: places a pin, sets navigation destination, animates camera.
   const handleLocationSelect = useCallback(
     (lat: number, lon: number, addr?: string) => {
       const title = addr || 'Selected Point';
@@ -268,18 +350,16 @@ export const MapScreen: React.FC = () => {
         { latitude: lat, longitude: lon, latitudeDelta: 0.003, longitudeDelta: 0.003 },
         800,
       );
-
-      console.log('[MapScreen] selectedDestination set (search):', title);
       console.log('[MapScreen] navigation sheet opening for search result');
     },
     [clearGeometry],
   );
 
-  // OSM parking zone marker tapped: triggers geometry fetch and bottom sheet
+  // OSM parking zone marker tapped: triggers geometry fetch and bottom sheet.
   const handlePressParkingZone = useCallback((parking: OsmParking) => {
-    if (isProcessingRef.current) return;
+    if (isProcessingRef.current || isGesturingRef.current) return;
     isProcessingRef.current = true;
-    setTimeout(() => { isProcessingRef.current = false; }, 300);
+    setTimeout(() => { isProcessingRef.current = false; }, 500);
 
     markerJustTappedRef.current = true;
     requestAnimationFrame(() => { markerJustTappedRef.current = false; });
@@ -300,23 +380,37 @@ export const MapScreen: React.FC = () => {
     setOsrmPolyline(null);
     loadGeometry(parking);
 
-    console.log('[MapScreen] selectedDestination set (parking):', dest.title);
     console.log('[MapScreen] navigation sheet opening for parking:', dest.title);
   }, [loadGeometry]);
 
-  // Cluster tapped: zoom in to break the cluster apart
+  // Suggestion card tapped: animates the camera to the spot then selects it.
+  const handlePressNearbySuggestion = useCallback(() => {
+    if (!nearestParking) return;
+    const { parking } = nearestParking;
+    mapRef.current?.animateToRegion(
+      { ...parking.position, latitudeDelta: 0.01, longitudeDelta: 0.01 },
+      600,
+    );
+    handlePressParkingZone(parking);
+  }, [nearestParking, handlePressParkingZone]);
+
+  // Cluster tapped: zoom in to break the cluster apart.
+  // Reads bounds from viewportBoundsRef (not state) so this callback is stable
+  // across pans — preventing every ClusterMarker from re-rendering each time
+  // the camera moves.
   const handlePressCluster = useCallback((position: LatLng) => {
-    const span = viewportBounds.north - viewportBounds.south;
+    if (isGesturingRef.current) return;
+    const bounds = viewportBoundsRef.current;
     mapRef.current?.animateToRegion(
       {
         latitude:       position.latitude,
         longitude:      position.longitude,
-        latitudeDelta:  span * 0.5,
-        longitudeDelta: (viewportBounds.east - viewportBounds.west) * 0.5,
+        latitudeDelta:  (bounds.north - bounds.south) * 0.5,
+        longitudeDelta: (bounds.east  - bounds.west)  * 0.5,
       },
       400,
     );
-  }, [viewportBounds]);
+  }, []); // stable — reads viewport from ref at call time
 
   // ── Bottom sheet handlers ─────────────────────────────────────────────────────
   const handleStartRoute = useCallback(() => {
@@ -326,13 +420,15 @@ export const MapScreen: React.FC = () => {
     setRouteInfo(null);
     setRouteError(null);
     setOsrmPolyline(null);
+    // Google routes are handled by MapViewDirections in the JSX below.
+    // Only run OSRM fetch manually when the provider is set to 'osrm'.
     if (NAVIGATION_PROVIDER !== 'osrm' || !userLocation) return;
     const fetchId = ++osrmFetchIdRef.current;
     console.log('[MapScreen] starting OSRM route fetch...');
     fetchOsrmRoute(userLocation, selectedDestination.position)
       .then((r) => {
         if (osrmFetchIdRef.current !== fetchId) return;
-        console.log('[MapScreen] route ready:', r.routeInfo.distance.toFixed(1), 'km,', r.routeInfo.duration.toFixed(0), 'min');
+        console.log('[MapScreen] route ready:', r.routeInfo.distance.toFixed(1), 'km');
         setOsrmPolyline(r.polyline);
         setRouteInfo(r.routeInfo);
       })
@@ -343,6 +439,7 @@ export const MapScreen: React.FC = () => {
         setRouteError(msg);
       });
   }, [userLocation, selectedDestination]);
+
   const handleCancelRoute = useCallback(() => {
     osrmFetchIdRef.current++;
     setActiveRoute(false);
@@ -350,6 +447,7 @@ export const MapScreen: React.FC = () => {
     setRouteError(null);
     setOsrmPolyline(null);
   }, []);
+
   const handleCloseSheet = useCallback(() => {
     osrmFetchIdRef.current++;
     setSelectedDestination(null);
@@ -375,6 +473,7 @@ export const MapScreen: React.FC = () => {
         showsMyLocationButton={false}
         onLongPress={handleLongPress}
         onPress={handleMapPress}
+        onRegionChange={handleRegionChange}
         onRegionChangeComplete={handleRegionChangeComplete}
         mapPadding={{ top: 120, right: 0, bottom: 0, left: 0 }}
       >
@@ -382,18 +481,6 @@ export const MapScreen: React.FC = () => {
           urlTemplate="https://openstreetmap.org{z}/{x}/{y}.png"
           zIndex={-1}
         />
-
-        {/* JSON parking spots from local data (filtered by free/all toggle) */}
-        {filteredSpots.map((spot) => (
-          <SpotMarker
-            key={spot.id}
-            spot={spot}
-            onPress={(s) => {
-              setSelectedSpot(s);
-              navigation.navigate("ParkingDetails", { spotId: s.id });
-            }}
-          />
-        ))}
 
         {/* OSM parking zones fetched from Overpass API — clusters + polygons */}
         <ParkingLayer
@@ -406,8 +493,10 @@ export const MapScreen: React.FC = () => {
           selectedPolygon={geometry?.polygon ?? null}
           selectedPolyline={geometry?.polyline ?? null}
           geometryLoading={geometryLoading}
+          showZonePolygons={showZonePolygons}
         />
 
+        {/* In-app Google route — rendered by MapViewDirections as a polyline */}
         {activeRoute && NAVIGATION_PROVIDER === 'google' && MAPS_APIKEY.length > 0 && userLocation && selectedDestination && (
           <MapViewDirections
             origin={userLocation}
@@ -427,6 +516,7 @@ export const MapScreen: React.FC = () => {
           />
         )}
 
+        {/* OSRM route polyline (only when NAVIGATION_PROVIDER=osrm) */}
         {activeRoute && NAVIGATION_PROVIDER === 'osrm' && osrmPolyline && (
           <Polyline
             coordinates={osrmPolyline}
@@ -435,6 +525,7 @@ export const MapScreen: React.FC = () => {
           />
         )}
 
+        {/* Fallback straight dashed line when the route provider fails */}
         {activeRoute && routeError && userLocation && selectedDestination && (
           <Polyline
             coordinates={[userLocation, selectedDestination.position]}
@@ -510,13 +601,19 @@ export const MapScreen: React.FC = () => {
         </View>
       </View>
 
-      {/* Recenter — bottom right; lifts above the keyboard when it opens */}
-      <View
-        style={[
-          styles.recenterContainer,
-          { bottom: keyboardHeight > 0 ? keyboardHeight + 12 : RECENTER_BOTTOM_DEFAULT },
-        ]}
-      >
+      {/* Driving aid — closest known parking area to the driver's live position */}
+      {showNearbySuggestion && nearestParking && (
+        <View style={styles.nearbySuggestionWrapper} pointerEvents="box-none">
+          <NearbyParkingSuggestion
+            parking={nearestParking.parking}
+            distanceMeters={nearestParking.distanceMeters}
+            onPress={handlePressNearbySuggestion}
+          />
+        </View>
+      )}
+
+      {/* Recenter — bottom right; lifts above the keyboard and/or the bottom info panel */}
+      <View style={[styles.recenterContainer, { bottom: recenterBottom }]}>
         <TouchableOpacity
           style={styles.recenterButton}
           onPress={() => mapRef.current?.animateToRegion(MALAGA_REGION, 800)}
@@ -525,7 +622,7 @@ export const MapScreen: React.FC = () => {
         </TouchableOpacity>
       </View>
 
-      {/* OSM parking zone detail + routing bottom sheet */}
+      {/* Universal destination + routing bottom sheet */}
       <RouteBottomSheet
         destination={selectedDestination}
         activeRoute={activeRoute}
@@ -564,8 +661,15 @@ const styles = StyleSheet.create({
   },
   searchBox: { flex: 1, zIndex: 110 },
   filterBox: { marginLeft: 10, zIndex: 100 },
+  nearbySuggestionWrapper: {
+    position: "absolute",
+    top: 96,
+    left: 16,
+    right: 16,
+    zIndex: 90,
+  },
   legendContainer: { position: "absolute", bottom: 260, left: 15 },
-  recenterContainer: { position: "absolute", bottom: 260, right: 20 },
+  recenterContainer: { position: "absolute", right: 20 },
   recenterButton: {
     backgroundColor: "white",
     width: 56,

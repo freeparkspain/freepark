@@ -18,8 +18,8 @@ interface Props {
   onClose:       () => void;
 }
 
-const SHEET_HEIGHT = 280;
-const ACCENT       = '#007AFF';
+export const SHEET_HEIGHT = 280;
+const ACCENT              = '#007AFF';
 
 function openInGoogleMaps(position: LatLng): void {
   const { latitude, longitude } = position;

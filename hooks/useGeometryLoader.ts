@@ -13,25 +13,25 @@ export const useGeometryLoader = () => {
   const abortCtrl = useRef<AbortController | null>(null);
 
   const loadGeometry = useCallback(async (parking: OsmParking) => {
-    // Clear stale geometry immediately — prevents the old polygon from
-    // flashing while the new one loads
+    // Abort ANY previous in-flight request upfront — before node/cache
+    // shortcuts — so a cached-path return can't be overtaken by the old
+    // request landing and overwriting the freshly-set geometry.
+    // Nulling abortCtrl prevents the aborted request's finally block from
+    // toggling loading state on the new selection.
+    abortCtrl.current?.abort();
+    abortCtrl.current = null;
+
     setGeometry(null);
+    setGeometryLoading(false);
 
-    // Nodes are single points; no ring geometry exists
-    if (parking.id.startsWith('n')) {
-      setGeometryLoading(false);
-      return;
-    }
+    if (parking.id.startsWith('n')) return;
 
-    // Instant path — already cached from a previous tap
     const cached = geometryCache.get(parking.id);
     if (cached) {
       setGeometry(cached);
       return;
     }
 
-    // Cancel any in-flight request from the previously selected parking
-    abortCtrl.current?.abort();
     const ctrl = new AbortController();
     abortCtrl.current = ctrl;
 
@@ -39,13 +39,10 @@ export const useGeometryLoader = () => {
     try {
       const result = await fetchParkingGeometry(parking.id, ctrl.signal);
       geometryCache.set(parking.id, result);
-      if (abortCtrl.current === ctrl) {
-        setGeometry(result);
-      }
+      if (abortCtrl.current === ctrl) setGeometry(result);
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
       console.warn('[useGeometryLoader]', err);
-      if (abortCtrl.current === ctrl) setGeometry(null);
     } finally {
       if (abortCtrl.current === ctrl) setGeometryLoading(false);
     }

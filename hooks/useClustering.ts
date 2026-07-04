@@ -43,9 +43,13 @@ export const useClustering = (
 ): LayerItem[] => {
 
   // ── Level 1: build spatial index ──────────────────────────────────────────
-  // Supercluster uses a static R-tree internally, so this is the expensive
-  // step. We memo on `parkings` identity — new fetches produce a new array
-  // reference, which triggers a rebuild. Panning/zooming does not.
+  // Rebuild ONLY when the set of parking IDs changes (new spots discovered).
+  // Geometry updates (polygon/polyline added to existing spots) change the
+  // `parkings` array reference but NOT IDs or positions — no index rebuild
+  // needed.  `parkings.length` is a safe proxy: IDs are immutable OSM
+  // identifiers that are only ever added to the module cache, never removed.
+  // ParkingLayer reads fresh geometry from its own `parkingMap` memo, so
+  // stale parking objects inside the index features are harmless.
   const index = useMemo(() => {
     const sc = new Supercluster<PointProps>({
       radius:  60,   // pixel grouping radius at each zoom level
@@ -63,7 +67,8 @@ export const useClustering = (
       })),
     );
     return sc;
-  }, [parkings]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parkings.length]);
 
   // ── Level 2: query clusters for current viewport ──────────────────────────
   // Clamping zoom to [0, 20] guards against extreme latitudeDelta values.
