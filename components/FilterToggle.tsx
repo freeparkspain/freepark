@@ -1,11 +1,18 @@
 import React from "react";
 import { TouchableOpacity, Text, View } from "react-native";
-import { useParkingStore, useFilteredSpots } from "../store/useParkingStore";
+import { useParkingStore } from "../store/useParkingStore";
 
+interface Props {
+  /** Number of parking spots currently visible under the active filter. */
+  count?: number;
+}
+
+// Compact free/paid toggle shown to the right of the search bar.
+// Drives the OSM parking layer's visibility (see MapScreen `visibleParkings`).
 // No absolute positioning — parent (MapScreen header row) controls placement.
-export const FilterToggle: React.FC = () => {
-  const { filterOnlyFree, toggleFilterOnlyFree } = useParkingStore();
-  const filteredSpots = useFilteredSpots();
+export const FilterToggle: React.FC<Props> = ({ count }) => {
+  const filterOnlyFree     = useParkingStore((s) => s.filterOnlyFree);
+  const toggleFilterOnlyFree = useParkingStore((s) => s.toggleFilterOnlyFree);
 
   return (
     <TouchableOpacity
@@ -22,19 +29,21 @@ export const FilterToggle: React.FC = () => {
       >
         {filterOnlyFree ? "Free Only" : "All Parking"}
       </Text>
-      <View
-        className={`rounded-full px-2 py-0.5 ${
-          filterOnlyFree ? "bg-blue-400" : "bg-gray-100"
-        }`}
-      >
-        <Text
-          className={`text-xs font-bold ${
-            filterOnlyFree ? "text-white" : "text-gray-600"
+      {count !== undefined && (
+        <View
+          className={`rounded-full px-2 py-0.5 ${
+            filterOnlyFree ? "bg-blue-400" : "bg-gray-100"
           }`}
         >
-          {filteredSpots.length}
-        </Text>
-      </View>
+          <Text
+            className={`text-xs font-bold ${
+              filterOnlyFree ? "text-white" : "text-gray-600"
+            }`}
+          >
+            {count}
+          </Text>
+        </View>
+      )}
     </TouchableOpacity>
   );
 };

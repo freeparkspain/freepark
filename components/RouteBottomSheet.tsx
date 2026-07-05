@@ -7,15 +7,17 @@ import { SelectedDestination, RouteInfo, LatLng } from '../types/parking';
 import { formatDistance, formatDuration, haversineDistance } from '../utils/geo';
 
 interface Props {
-  destination:   SelectedDestination | null;
-  activeRoute:   boolean;
-  routeInfo:     RouteInfo | null;
-  userLocation:  LatLng | null;
-  canNavigate:   boolean;
-  routeError:    string | null;
-  onStartRoute:  () => void;
-  onCancelRoute: () => void;
-  onClose:       () => void;
+  destination:       SelectedDestination | null;
+  activeRoute:       boolean;
+  routeInfo:         RouteInfo | null;
+  userLocation:      LatLng | null;
+  canNavigate:       boolean;
+  routeError:        string | null;
+  locationDenied:    boolean;
+  onStartRoute:      () => void;
+  onCancelRoute:     () => void;
+  onRequestLocation: () => void;
+  onClose:           () => void;
 }
 
 export const SHEET_HEIGHT = 280;
@@ -45,7 +47,7 @@ const TYPE_ICON: Record<SelectedDestination['type'], string> = {
 
 export const RouteBottomSheet: React.FC<Props> = ({
   destination, activeRoute, routeInfo, userLocation, canNavigate, routeError,
-  onStartRoute, onCancelRoute, onClose,
+  locationDenied, onStartRoute, onCancelRoute, onRequestLocation, onClose,
 }) => {
   const translateY = useRef(new Animated.Value(SHEET_HEIGHT)).current;
 
@@ -62,10 +64,11 @@ export const RouteBottomSheet: React.FC<Props> = ({
     ? haversineDistance(userLocation, destination.position)
     : null;
 
-  const startDisabled = !canNavigate || !userLocation;
-  const startLabel    = !userLocation
-    ? '📍 Waiting for location…'
-    : !canNavigate
+  // Start Route stays enabled as long as an in-app provider exists — it
+  // acquires the location on demand when pressed, so we never sit disabled on
+  // "Waiting for location…". It's only truly blocked with no provider at all.
+  const startDisabled = !canNavigate;
+  const startLabel    = !canNavigate
     ? '⚙️ No route provider configured'
     : '🗺 Start Route';
 
@@ -88,10 +91,18 @@ export const RouteBottomSheet: React.FC<Props> = ({
 
           {!activeRoute ? (
             <>
-              {straightDist !== null && (
+              {straightDist !== null ? (
                 <Text style={styles.distance}>
                   {formatDistance(straightDist / 1000)} straight line
                 </Text>
+              ) : locationDenied ? (
+                <TouchableOpacity onPress={onRequestLocation} activeOpacity={0.7}>
+                  <Text style={styles.locationHint}>
+                    📍 Location is off — tap to enable for in-app routing
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <Text style={styles.distance}>📍 Locating you…</Text>
               )}
 
               <TouchableOpacity
@@ -181,6 +192,10 @@ const styles = StyleSheet.create({
   title:     { flex: 1, fontSize: 15, fontWeight: '700', color: '#111827' },
   closeIcon: { fontSize: 16, color: '#9CA3AF', paddingLeft: 8 },
   distance:  { fontSize: 13, color: '#6B7280', marginBottom: 10 },
+  locationHint: {
+    fontSize: 13, color: '#92400E', marginBottom: 10,
+    backgroundColor: '#FEF3C7', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10,
+  },
   routeBtn:  { borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginBottom: 8 },
   routeBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
   gmapsBtn: {

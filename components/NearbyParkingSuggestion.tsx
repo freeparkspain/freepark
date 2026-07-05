@@ -2,17 +2,13 @@ import React from 'react';
 import { TouchableOpacity, Text, View, StyleSheet, Platform } from 'react-native';
 import { OsmParking } from '../types/parking';
 import { formatDistance } from '../utils/geo';
+import { parkingName } from '../utils/parking';
 import { PARKING_ACCENT, PARKING_ACCENT_DEEP } from './ParkingMarker';
 
 interface Props {
   parking:        OsmParking;
   distanceMeters: number;
   onPress:        () => void;
-}
-
-/** Имя парковки из OSM-тегов — то же правило, что и в RouteBottomSheet. */
-function parkingName(p: OsmParking): string {
-  return p.tags.name ?? p.tags['name:en'] ?? p.tags['name:ru'] ?? 'Parking';
 }
 
 // ─── NearbyParkingSuggestion ──────────────────────────────────────────────────

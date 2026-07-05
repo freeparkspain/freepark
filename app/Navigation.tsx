@@ -14,12 +14,13 @@ export const Navigation: React.FC = () => (
         headerStyle: { backgroundColor: '#3B82F6' },
         headerTintColor: '#ffffff',
         headerTitleStyle: { fontWeight: 'bold' },
+        headerTitleAlign: 'center',
       }}
     >
       <Stack.Screen
         name="Map"
         component={MapScreen}
-        options={{ title: 'FreePark — Málaga' }}
+        options={{ title: 'FreePark' }}
       />
       <Stack.Screen
         name="ParkingDetails"

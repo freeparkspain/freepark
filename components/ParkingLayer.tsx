@@ -4,7 +4,12 @@ import { Marker, Polygon, Polyline } from 'react-native-maps';
 import { OsmParking, LatLng, BBox } from '../types/parking';
 import { useClustering, ClusterItem } from '../hooks/useClustering';
 import { longestEdge } from '../utils/geo';
-import { ParkingMarker, PARKING_ACCENT, PARKING_ACCENT_DEEP } from './ParkingMarker';
+import { isPaidParking } from '../utils/parking';
+import {
+  ParkingMarker,
+  PARKING_ACCENT, PARKING_ACCENT_DEEP,
+  PAID_ACCENT, PAID_ACCENT_DEEP,
+} from './ParkingMarker';
 
 // ─── Geometry styles ──────────────────────────────────────────────────────────
 // At rest, a park area is previewed as a single dashed *line* (its longest
@@ -19,18 +24,22 @@ import { ParkingMarker, PARKING_ACCENT, PARKING_ACCENT_DEEP } from './ParkingMar
 // signal instead of several.
 
 // At-rest preview: a thin dashed line tracing the area's longest edge.
-const ZONE_LINE = { color: PARKING_ACCENT, width: 3, dash: [9, 7] };
+// Paid zones use the same warm orange as the paid marker so a driver reads one
+// consistent "this costs money" signal across marker + zone. Free stays blue.
+const ZONE_LINE      = { color: PARKING_ACCENT, width: 3, dash: [9, 7] };
+const ZONE_LINE_PAID = { color: PAID_ACCENT,    width: 3, dash: [9, 7] };
 // Once another zone is selected, the rest fade to a faint trace — present
 // enough to confirm "more parking this way" without competing for attention.
-// This is the actual decluttering lever: instead of N equally-loud lines
-// fighting the road for the driver's eye, only the relevant one stays crisp.
-const ZONE_LINE_DIM = { color: 'rgba(0,122,255,0.28)', width: 2.5, dash: [6, 8] };
+const ZONE_LINE_DIM      = { color: 'rgba(0,122,255,0.28)', width: 2.5, dash: [6, 8] };
+const ZONE_LINE_DIM_PAID = { color: 'rgba(249,115,22,0.30)', width: 2.5, dash: [6, 8] };
 // Selected: the real zone — full contour, solidly filled. What the preview
 // line "becomes" once tapped.
-const SELECTED_ZONE = { fill: 'rgba(0,122,255,0.26)', stroke: PARKING_ACCENT_DEEP, width: 3 };
+const SELECTED_ZONE      = { fill: 'rgba(0,122,255,0.26)',  stroke: PARKING_ACCENT_DEEP, width: 3 };
+const SELECTED_ZONE_PAID = { fill: 'rgba(249,115,22,0.24)', stroke: PAID_ACCENT_DEEP,    width: 3 };
 // Genuine OSM polylines (street_side / lane parking — already line-shaped in
 // the source data, unrelated to the zone-preview line above).
-const LINE = { color: PARKING_ACCENT, width: 8 };
+const LINE      = { color: PARKING_ACCENT, width: 8 };
+const LINE_PAID = { color: PAID_ACCENT,    width: 8 };
 
 // ─── SelectedGeometryLayer ────────────────────────────────────────────────────
 // Isolated into its own memo'd component so that polygon load / unload events
@@ -42,6 +51,7 @@ interface GeometryLayerProps {
   polygon:           LatLng[] | null;
   polyline:          LatLng[] | null;
   visible:           boolean;
+  paid:              boolean;
 }
 
 const SelectedGeometryLayer = memo(({
@@ -49,33 +59,38 @@ const SelectedGeometryLayer = memo(({
   polygon,
   polyline,
   visible,
-}: GeometryLayerProps) => (
-  <>
-    {visible && polygon && selectedParkingId && (
-      <Polygon
-        key={`zone-selected-${selectedParkingId}`}
-        coordinates={polygon}
-        fillColor={SELECTED_ZONE.fill}
-        strokeColor={SELECTED_ZONE.stroke}
-        strokeWidth={SELECTED_ZONE.width}
-        lineJoin="round"
-        lineCap="round"
-        zIndex={2}
-      />
-    )}
-    {visible && polyline && !polygon && selectedParkingId && (
-      <Polyline
-        key={`line-${selectedParkingId}`}
-        coordinates={polyline}
-        strokeColor={LINE.color}
-        strokeWidth={LINE.width}
-        lineCap="round"
-        lineJoin="round"
-        zIndex={2}
-      />
-    )}
-  </>
-));
+  paid,
+}: GeometryLayerProps) => {
+  const zone = paid ? SELECTED_ZONE_PAID : SELECTED_ZONE;
+  const line = paid ? LINE_PAID : LINE;
+  return (
+    <>
+      {visible && polygon && selectedParkingId && (
+        <Polygon
+          key={`zone-selected-${selectedParkingId}`}
+          coordinates={polygon}
+          fillColor={zone.fill}
+          strokeColor={zone.stroke}
+          strokeWidth={zone.width}
+          lineJoin="round"
+          lineCap="round"
+          zIndex={2}
+        />
+      )}
+      {visible && polyline && !polygon && selectedParkingId && (
+        <Polyline
+          key={`line-${selectedParkingId}`}
+          coordinates={polyline}
+          strokeColor={line.color}
+          strokeWidth={line.width}
+          lineCap="round"
+          lineJoin="round"
+          zIndex={2}
+        />
+      )}
+    </>
+  );
+});
 
 // ─── Cluster marker ───────────────────────────────────────────────────────────
 
@@ -141,7 +156,10 @@ const ZoneLine = memo(({ parking, dimmed, onPress }: {
   if (!parking.polygon) return null;
   const edge = longestEdge(parking.polygon);
   if (!edge) return null;
-  const style = dimmed ? ZONE_LINE_DIM : ZONE_LINE;
+  const paid  = isPaidParking(parking.tags);
+  const style = dimmed
+    ? (paid ? ZONE_LINE_DIM_PAID : ZONE_LINE_DIM)
+    : (paid ? ZONE_LINE_PAID     : ZONE_LINE);
   return (
     <Polyline
       key={`zone-line-${parking.id}`}
@@ -206,6 +224,11 @@ export const ParkingLayer = memo(({
     [parkings],
   );
 
+  // Is the currently-selected parking paid? Drives the orange vs blue zone
+  // styling so the selected polygon/line matches the marker's colour language.
+  const selectedParking = selectedParkingId ? parkingMap.get(selectedParkingId) : undefined;
+  const selectedPaid    = selectedParking ? isPaidParking(selectedParking.tags) : false;
+
   return (
     <>
       {/*
@@ -218,6 +241,7 @@ export const ParkingLayer = memo(({
         polygon={selectedPolygon}
         polyline={selectedPolyline}
         visible={showZonePolygons}
+        paid={selectedPaid}
       />
 
       {/* ── Zone outlines — individual (non-clustered) areas only, close zoom only ──
@@ -262,11 +286,8 @@ const styles = StyleSheet.create({
     borderColor:     '#ffffff',
     justifyContent:  'center',
     alignItems:      'center',
-    shadowColor:     '#000',
-    shadowOffset:    { width: 0, height: 2 },
-    shadowOpacity:   0.30,
-    shadowRadius:    4,
-    elevation:       8,
+    // No shadow/elevation — on Android elevation drew a gray square behind the
+    // circular bubble at some zoom levels. The white border keeps it legible.
   },
   clusterText: { color: '#ffffff', fontWeight: '800' },
 });

@@ -9,8 +9,7 @@ import {
   Platform,
 } from "react-native";
 import MapView, {
-  UrlTile,
-  PROVIDER_DEFAULT,
+  PROVIDER_GOOGLE,
   Marker,
   Callout,
   MapMarker,
@@ -30,10 +29,12 @@ import { RouteBottomSheet, SHEET_HEIGHT } from "../components/RouteBottomSheet";
 import { NearbyParkingSuggestion } from "../components/NearbyParkingSuggestion";
 import { useMapParkings } from "../hooks/useMapParkings";
 import { useGeometryLoader } from "../hooks/useGeometryLoader";
+import { useParkingStore } from "../store/useParkingStore";
 import { OsmParking, LatLng, BBox, RouteInfo, SelectedDestination } from "../types/parking";
 import { MAPS_APIKEY, NAVIGATION_PROVIDER } from "../constants/maps";
 import { fetchOsrmRoute } from "../services/navigation/osrmNavigation";
-import { viewportRadiusMeters, haversineDistance } from "../utils/geo";
+import { viewportRadiusMeters, haversineDistance, deltaToZoom } from "../utils/geo";
+import { isPaidParking } from "../utils/parking";
 
 export const MALAGA_REGION = {
   latitude: 36.7213,
@@ -45,10 +46,18 @@ export const MALAGA_REGION = {
 const RECENTER_BOTTOM_DEFAULT    = 40;
 const RECENTER_LIFT_MARGIN       = 12;
 const PARK_AREA_RADIUS_LIMIT_M   = 2_000;
-const AUTO_LOAD_MOVE_THRESHOLD_M = 1_200;
-const AUTO_LOAD_DELTA            = 0.03;
 const NEARBY_SUGGESTION_RADIUS_M = 1_500;
 const SUGGESTION_RECOMPUTE_THRESHOLD_M = 80;
+// Below this zoom, parking markers hide entirely (Google-Maps-like) — even
+// when display is enabled. Matches the fetch threshold (useMapParkings MIN_ZOOM)
+// and the default MALAGA_REGION view (~zoom 12) so a Search Parking press from
+// the initial camera actually reveals markers; clustering keeps city-zoom dense
+// areas to a handful of bubbles, so this is safe without going higher.
+const PARKING_MIN_VISIBLE_ZOOM   = 12;
+
+// Stable empty array so gating parking off doesn't allocate a new reference
+// every render (which would thrash the Supercluster index memo downstream).
+const EMPTY_PARKINGS: OsmParking[] = [];
 
 function regionToBBox(r: Region): BBox {
   return {
@@ -89,8 +98,9 @@ export const MapScreen: React.FC = () => {
   // callback reference stable prevents all ClusterMarker components from
   // re-rendering on every pan event.
   const viewportBoundsRef   = useRef<BBox>(regionToBBox(MALAGA_REGION));
-  // Centre of the last auto-load triggered by the driver's own movement.
-  const lastAutoLoadCenter  = useRef<LatLng | null>(null);
+  // Latest camera region — the "Search Parking" button fetches for this on
+  // demand (parking is never auto-loaded on pan/zoom anymore).
+  const lastRegionRef       = useRef<Region>(MALAGA_REGION);
   const osrmFetchIdRef      = useRef(0);
 
   // ── Search / long-press pin state ────────────────────────────────────────────
@@ -122,6 +132,14 @@ export const MapScreen: React.FC = () => {
   const [osrmPolyline,        setOsrmPolyline]        = useState<LatLng[] | null>(null);
   const [selectedDestination, setSelectedDestination] = useState<SelectedDestination | null>(null);
   const [userLocation,        setUserLocation]        = useState<LatLng | null>(null);
+  const [locationDenied,      setLocationDenied]      = useState(false);
+
+  // Parking is only rendered after the user explicitly taps "Search Parking".
+  // Cache still hydrates into `parkings` in the background, but nothing shows
+  // on the map until this flag flips true. Zooming out below the threshold
+  // resets it (see handleRegionChangeComplete), so zooming back in requires a
+  // fresh press — exactly how Google Maps gates its own POIs.
+  const [parkingDisplayEnabled, setParkingDisplayEnabled] = useState(false);
 
   // Closest known parking area to the driver — see the throttled scan effect below.
   const [nearestParking, setNearestParking] = useState<{
@@ -132,6 +150,21 @@ export const MapScreen: React.FC = () => {
 
   // ── Keyboard state ─────────────────────────────────────────────────────────────
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  // ── Free/paid filter ─────────────────────────────────────────────────────────
+  // Drives which OSM markers/clusters render. "Free Only" hides paid spots from
+  // the map (and clustering) but never deletes them from the cache.
+  const filterOnlyFree = useParkingStore((s) => s.filterOnlyFree);
+
+  // Gate rendering by zoom + manual-display flag, THEN apply the free/paid
+  // filter. Source `parkings` (and the persistent cache) are never mutated —
+  // this only decides what is drawn.
+  const currentZoom    = deltaToZoom(latDelta);
+  const parkingVisible = parkingDisplayEnabled && currentZoom >= PARKING_MIN_VISIBLE_ZOOM;
+  const visibleParkings = React.useMemo(() => {
+    if (!parkingVisible) return EMPTY_PARKINGS;
+    return filterOnlyFree ? parkings.filter((p) => !isPaidParking(p.tags)) : parkings;
+  }, [parkingVisible, parkings, filterOnlyFree]);
 
   const canNavigate = NAVIGATION_PROVIDER === 'osrm' || MAPS_APIKEY.length > 0;
 
@@ -161,36 +194,64 @@ export const MapScreen: React.FC = () => {
     }
   }, [searchPin]);
 
-  // Location permission + live tracking for routing distance calculation
+  // Location permission + live tracking for routing. Grabs a fast one-shot fix
+  // via getCurrentPositionAsync FIRST (watchPositionAsync can take many seconds
+  // to emit its first sample — that lag was the "Waiting for location…" the
+  // bottom sheet got stuck on), then subscribes for live updates.
   useEffect(() => {
     let sub: Location.LocationSubscription | null = null;
+    let cancelled = false;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") return;
+      if (status !== "granted") {
+        if (!cancelled) setLocationDenied(true);
+        return;
+      }
+      if (!cancelled) setLocationDenied(false);
+      try {
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (!cancelled) {
+          setUserLocation({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
+        }
+      } catch {
+        /* one-shot fix failed — the watcher below still provides a position */
+      }
       sub = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.Balanced, distanceInterval: 10 },
         (loc) =>
           setUserLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude }),
       );
     })();
-    return () => { sub?.remove(); };
+    return () => { cancelled = true; sub?.remove(); };
   }, []);
 
-  // Driving aid: load parking data around the driver, not just the viewport.
-  useEffect(() => {
-    if (!userLocation) return;
-    const last = lastAutoLoadCenter.current;
-    if (last && haversineDistance(last, userLocation) < AUTO_LOAD_MOVE_THRESHOLD_M) return;
-    lastAutoLoadCenter.current = userLocation;
-    loadForRegion({
-      latitude:       userLocation.latitude,
-      longitude:      userLocation.longitude,
-      latitudeDelta:  AUTO_LOAD_DELTA,
-      longitudeDelta: AUTO_LOAD_DELTA,
-    });
-  }, [userLocation, loadForRegion]);
+  // On-demand location acquisition — used by "Start Route" and the sheet's
+  // "Enable location" retry. Requests permission if needed and resolves a fresh
+  // fix without waiting for the watcher. Returns null (never throws) if the
+  // user has denied access, so the caller can fall back gracefully.
+  const ensureUserLocation = useCallback(async (): Promise<LatLng | null> => {
+    if (userLocation) return userLocation;
+    try {
+      let { status } = await Location.getForegroundPermissionsAsync();
+      if (status !== "granted") {
+        status = (await Location.requestForegroundPermissionsAsync()).status;
+      }
+      if (status !== "granted") { setLocationDenied(true); return null; }
+      setLocationDenied(false);
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+      setUserLocation(loc);
+      return loc;
+    } catch {
+      return null;
+    }
+  }, [userLocation]);
 
   // Driving aid: throttled "nearest parking" scan.
+  // Scans visibleParkings (the filtered set) so a driver on "Free Only" is
+  // never steered toward a paid spot the map itself is hiding. Re-scans only
+  // when the driver has moved far enough to plausibly change the answer, or
+  // fresh data arrived — never on every ~10 m GPS tick.
   useEffect(() => {
     if (!userLocation) {
       suggestionScanRef.current = null;
@@ -200,14 +261,14 @@ export const MapScreen: React.FC = () => {
 
     const prev        = suggestionScanRef.current;
     const movedEnough = !prev || haversineDistance(prev.at, userLocation) >= SUGGESTION_RECOMPUTE_THRESHOLD_M;
-    const dataChanged = !prev || prev.parkings !== parkings;
+    const dataChanged = !prev || prev.parkings !== visibleParkings;
     if (!movedEnough && !dataChanged) return;
 
-    suggestionScanRef.current = { at: userLocation, parkings };
+    suggestionScanRef.current = { at: userLocation, parkings: visibleParkings };
 
     let best: OsmParking | null = null;
     let bestDist = Infinity;
-    for (const p of parkings) {
+    for (const p of visibleParkings) {
       const d = haversineDistance(userLocation, p.position);
       if (d < bestDist) { bestDist = d; best = p; }
     }
@@ -216,18 +277,16 @@ export const MapScreen: React.FC = () => {
         ? { parking: best, distanceMeters: bestDist }
         : null,
     );
-  }, [userLocation, parkings]);
+  }, [userLocation, visibleParkings]);
 
-  // Trigger initial OSM parking zone load (onRegionChangeComplete may not fire on first render)
+  // Once parking is displayed AND the camera is close enough to show zone
+  // outlines, fetch full ring geometry for the on-screen zones that don't have
+  // it yet — in one batched request. Gated by parkingVisible so it never fires
+  // while markers are hidden (no display = no geometry pulls). Iterates the
+  // filtered `visibleParkings` so paid zones aren't fetched while on Free Only.
   useEffect(() => {
-    loadForRegion(MALAGA_REGION);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Once the camera is close enough to show zone outlines, fetch full ring geometry
-  // for the on-screen zones that don't have it yet — in one batched request.
-  useEffect(() => {
-    if (!showZonePolygons) return;
-    const visibleIds = parkings
+    if (!parkingVisible || !showZonePolygons) return;
+    const visibleIds = visibleParkings
       .filter(p =>
         !p.polygon && !p.polyline &&
         p.position.latitude  >= viewportBounds.south && p.position.latitude  <= viewportBounds.north &&
@@ -235,7 +294,28 @@ export const MapScreen: React.FC = () => {
       )
       .map(p => p.id);
     if (visibleIds.length) loadZoneGeometry(visibleIds);
-  }, [showZonePolygons, parkings, viewportBounds, loadZoneGeometry]);
+  }, [parkingVisible, showZonePolygons, visibleParkings, viewportBounds, loadZoneGeometry]);
+
+  // Free Only just hid the selected paid parking — clear its selection, geometry
+  // and any route targeting it so nothing points at a spot that's no longer
+  // renderable (the stale selected-id + geometry was the filter-toggle crash).
+  // Source data/cache is untouched; toggling back to All Parking restores it.
+  // Looks the spot up in the FULL source `parkings`, since by now it's already
+  // been filtered out of `visibleParkings`.
+  useEffect(() => {
+    if (!filterOnlyFree || !selectedParkingId) return;
+    const sel = parkings.find(p => p.id === selectedParkingId);
+    if (!sel || !isPaidParking(sel.tags)) return;
+    setSelectedParkingId(null);
+    clearGeometry();
+    setSelectedDestination(prev =>
+      prev && prev.type === 'parking' && prev.id === selectedParkingId ? null : prev);
+    osrmFetchIdRef.current++;
+    setActiveRoute(false);
+    setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
+  }, [filterOnlyFree, selectedParkingId, parkings, clearGeometry]);
 
   // Keyboard listeners: lift the recenter button above the keyboard while it is open.
   useEffect(() => {
@@ -262,9 +342,28 @@ export const MapScreen: React.FC = () => {
     gestureSettleTimer.current = setTimeout(() => {
       isGesturingRef.current = false;
     }, 100);
+    // Keep clustering + zone-outline visibility tracking the camera, but do NOT
+    // fetch parking on move — the user pulls new data explicitly via the
+    // "Search Parking" button (see handleSearchParking). This is what stops the
+    // constant Overpass churn that drove the jank/crashes during browsing.
+    lastRegionRef.current = region;
     setLatDelta(region.latitudeDelta);
     setViewportBounds(regionToBBox(region));
-    loadForRegion(region);
+    // Zoomed out below the display threshold → hide parking and require a fresh
+    // "Search Parking" press when zooming back in (Google-Maps-like behaviour).
+    if (deltaToZoom(region.latitudeDelta) < PARKING_MIN_VISIBLE_ZOOM) {
+      setParkingDisplayEnabled(false);
+    }
+  }, []);
+
+  // Manual parking fetch + display for the current viewport — the ONLY path
+  // that pulls new Overpass data and the ONLY thing that reveals markers.
+  // loadForRegion keeps its own debounce/coverage/cooldown guards, so repeated
+  // taps over an already-loaded area are cheap no-ops (no request storm).
+  const handleSearchParking = useCallback(() => {
+    console.log('[MapScreen] Search Parking pressed for current viewport');
+    setParkingDisplayEnabled(true);
+    loadForRegion(lastRegionRef.current);
   }, [loadForRegion]);
 
   // Marks the gesture as "in flight" on every frame the camera moves.
@@ -413,19 +512,34 @@ export const MapScreen: React.FC = () => {
   }, []); // stable — reads viewport from ref at call time
 
   // ── Bottom sheet handlers ─────────────────────────────────────────────────────
-  const handleStartRoute = useCallback(() => {
+  // Builds the route INSIDE the app. Enters the active-route state immediately
+  // (so the sheet shows "Calculating…"), then makes sure we have a location —
+  // acquiring one on demand if the watcher hasn't produced one yet, which is
+  // what kept the sheet stuck on "Waiting for location…". Google routes render
+  // via MapViewDirections in the JSX (needs userLocation in state); OSRM routes
+  // are fetched here. On failure the JSX draws a dashed straight-line fallback.
+  const handleStartRoute = useCallback(async () => {
     if (!selectedDestination) return;
     console.log('[MapScreen] Start Route pressed for:', selectedDestination.title);
     setActiveRoute(true);
     setRouteInfo(null);
     setRouteError(null);
     setOsrmPolyline(null);
-    // Google routes are handled by MapViewDirections in the JSX below.
-    // Only run OSRM fetch manually when the provider is set to 'osrm'.
-    if (NAVIGATION_PROVIDER !== 'osrm' || !userLocation) return;
+
+    const loc = userLocation ?? await ensureUserLocation();
+    if (!loc) {
+      console.warn('[MapScreen] Start Route: no location available');
+      setRouteError('Location unavailable — enable location access to route');
+      return;
+    }
+
+    // Google provider: MapViewDirections in the JSX draws the polyline + ETA
+    // once userLocation is in state (ensureUserLocation set it above).
+    if (NAVIGATION_PROVIDER !== 'osrm') return;
+
     const fetchId = ++osrmFetchIdRef.current;
     console.log('[MapScreen] starting OSRM route fetch...');
-    fetchOsrmRoute(userLocation, selectedDestination.position)
+    fetchOsrmRoute(loc, selectedDestination.position)
       .then((r) => {
         if (osrmFetchIdRef.current !== fetchId) return;
         console.log('[MapScreen] route ready:', r.routeInfo.distance.toFixed(1), 'km');
@@ -438,7 +552,7 @@ export const MapScreen: React.FC = () => {
         console.warn('[MapScreen] route failed:', msg);
         setRouteError(msg);
       });
-  }, [userLocation, selectedDestination]);
+  }, [userLocation, selectedDestination, ensureUserLocation]);
 
   const handleCancelRoute = useCallback(() => {
     osrmFetchIdRef.current++;
@@ -466,9 +580,12 @@ export const MapScreen: React.FC = () => {
       <MapView
         ref={mapRef}
         style={styles.map}
-        provider={PROVIDER_DEFAULT}
+        // Google Maps engine on BOTH iOS and Android (never Apple Maps). The
+        // native SDK key is injected via app.config.js from
+        // EXPO_PUBLIC_GOOGLE_MAPS_API_KEY. Requires a dev/prebuild — in Expo Go
+        // on iOS the provider silently falls back to Apple Maps.
+        provider={PROVIDER_GOOGLE}
         initialRegion={MALAGA_REGION}
-        mapType="none"
         showsUserLocation
         showsMyLocationButton={false}
         onLongPress={handleLongPress}
@@ -477,14 +594,10 @@ export const MapScreen: React.FC = () => {
         onRegionChangeComplete={handleRegionChangeComplete}
         mapPadding={{ top: 120, right: 0, bottom: 0, left: 0 }}
       >
-        <UrlTile
-          urlTemplate="https://openstreetmap.org{z}/{x}/{y}.png"
-          zIndex={-1}
-        />
-
-        {/* OSM parking zones fetched from Overpass API — clusters + polygons */}
+        {/* OSM parking zones fetched from Overpass API — clusters + polygons.
+            Rendered over the Google basemap; free/paid filter applied upstream. */}
         <ParkingLayer
-          parkings={parkings}
+          parkings={visibleParkings}
           selectedParkingId={selectedParkingId}
           latitudeDelta={latDelta}
           viewportBounds={viewportBounds}
@@ -597,8 +710,24 @@ export const MapScreen: React.FC = () => {
           />
         </View>
         <View style={styles.filterBox}>
-          <FilterToggle />
+          <FilterToggle count={visibleParkings.length} />
         </View>
+      </View>
+
+      {/* Manual "Search Parking" — the only trigger that pulls new Overpass
+          data. Always visible directly under the search bar; the search
+          results dropdown (higher zIndex) overlays it while typing. */}
+      <View style={styles.searchParkingWrapper} pointerEvents="box-none">
+        <TouchableOpacity
+          style={[styles.searchParkingBtn, loading && styles.searchParkingBtnBusy]}
+          onPress={handleSearchParking}
+          activeOpacity={0.85}
+          disabled={loading}
+        >
+          <Text style={styles.searchParkingText}>
+            {loading ? 'Searching…' : '🅿  Search Parking'}
+          </Text>
+        </TouchableOpacity>
       </View>
 
       {/* Driving aid — closest known parking area to the driver's live position */}
@@ -630,8 +759,10 @@ export const MapScreen: React.FC = () => {
         userLocation={userLocation}
         canNavigate={canNavigate}
         routeError={routeError}
+        locationDenied={locationDenied}
         onStartRoute={handleStartRoute}
         onCancelRoute={handleCancelRoute}
+        onRequestLocation={ensureUserLocation}
         onClose={handleCloseSheet}
       />
     </View>
@@ -661,12 +792,38 @@ const styles = StyleSheet.create({
   },
   searchBox: { flex: 1, zIndex: 110 },
   filterBox: { marginLeft: 10, zIndex: 100 },
-  nearbySuggestionWrapper: {
+  searchParkingWrapper: {
     position: "absolute",
-    top: 96,
+    top: 92,
     left: 16,
     right: 16,
-    zIndex: 90,
+    zIndex: 80,
+  },
+  searchParkingBtn: {
+    backgroundColor: "#16A34A",
+    borderRadius: 16,
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.22,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  searchParkingBtnBusy: { backgroundColor: "#4B9E6A" },
+  searchParkingText: {
+    color: "#ffffff",
+    fontSize: 15,
+    fontWeight: "800",
+    letterSpacing: 0.2,
+  },
+  nearbySuggestionWrapper: {
+    position: "absolute",
+    top: 150,
+    left: 16,
+    right: 16,
+    zIndex: 70,
   },
   legendContainer: { position: "absolute", bottom: 260, left: 15 },
   recenterContainer: { position: "absolute", right: 20 },

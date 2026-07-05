@@ -6,7 +6,7 @@ A React Native (Expo) mobile app showing free parking spots in Málaga, Spain on
 
 ## Tech Decisions
 
-- **react-native-maps + UrlTile**: OSM tiles are loaded as a tile overlay on a base MapView. `mapType="none"` removes the default basemap so only OSM renders.
+- **react-native-maps + Google Maps**: `provider={PROVIDER_GOOGLE}` renders the Google basemap on **both** iOS and Android (never Apple Maps). The native SDK key is injected by `app.config.js` from `EXPO_PUBLIC_GOOGLE_MAPS_API_KEY` (`.env`). OpenStreetMap/Overpass is still the source for parking **data/geometry/search**, but no longer the basemap tiles. Requires a dev/prebuild — in Expo Go on iOS the provider falls back to Apple Maps.
 - **Zustand**: Single flat store. `useFilteredSpots` is a derived selector exported from the store file — not a store slice.
 - **NativeWind v4**: `className` prop on RN components. Config in `tailwind.config.js`, CSS entry in `global.css`, imported in `App.tsx`. `jsxImportSource: "nativewind"` in babel config handles JSX transform.
 - **React Navigation Native Stack**: Two screens — `Map` and `ParkingDetails`. Params typed via `RootStackParamList` in `types/parking.ts`.
