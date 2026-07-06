@@ -53,18 +53,31 @@ export const useClustering = (
   const index = useMemo(() => {
     const sc = new Supercluster<PointProps>({
       radius:  60,   // pixel grouping radius at each zoom level
-      maxZoom: 16,   // individual markers above zoom 16
+      // Cluster ONLY at far zoom. Above zoom 13 (medium + close views) points
+      // are returned individually, so the "P" icons are never grouped when the
+      // user is looking at a neighbourhood/street; clusters appear only when
+      // zoomed out to district/city level.
+      maxZoom: 13,
       minZoom: 1,
     });
+    // Only feed finite, in-range coordinates to Supercluster — a NaN/Infinity
+    // point makes getClusters() throw and crashes the whole map.
     sc.load(
-      parkings.map(p => ({
-        type:       'Feature' as const,
-        geometry:   {
-          type:        'Point' as const,
-          coordinates: [p.position.longitude, p.position.latitude],
-        },
-        properties: { parking: p },
-      })),
+      parkings
+        .filter(p =>
+          Number.isFinite(p.position.latitude) &&
+          Number.isFinite(p.position.longitude) &&
+          Math.abs(p.position.latitude)  <= 90 &&
+          Math.abs(p.position.longitude) <= 180,
+        )
+        .map(p => ({
+          type:       'Feature' as const,
+          geometry:   {
+            type:        'Point' as const,
+            coordinates: [p.position.longitude, p.position.latitude],
+          },
+          properties: { parking: p },
+        })),
     );
     return sc;
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -73,13 +86,19 @@ export const useClustering = (
   // ── Level 2: query clusters for current viewport ──────────────────────────
   // Clamping zoom to [0, 20] guards against extreme latitudeDelta values.
   return useMemo(() => {
-    const zoom = Math.min(20, Math.max(0, Math.round(deltaToZoom(latitudeDelta))));
-    const bbox: [number, number, number, number] = [
-      viewportBounds.west,
-      viewportBounds.south,
-      viewportBounds.east,
-      viewportBounds.north,
-    ];
+    // Guard against NaN/Infinity zoom (a transient bad latitudeDelta during a
+    // camera animation) — getClusters(bbox, NaN) crashes Supercluster.
+    const rawZoom = deltaToZoom(latitudeDelta);
+    const zoom = Number.isFinite(rawZoom)
+      ? Math.min(20, Math.max(0, Math.round(rawZoom)))
+      : 14;
+
+    const { west, south, east, north } = viewportBounds;
+    // A non-finite bbox (bad region mid-animation) would also crash getClusters;
+    // skip this frame safely — the next valid region re-queries.
+    if (![west, south, east, north].every(Number.isFinite)) return [];
+
+    const bbox: [number, number, number, number] = [west, south, east, north];
 
     return index.getClusters(bbox, zoom).map(feature => {
       const [lon, lat] = feature.geometry.coordinates;

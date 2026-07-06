@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import {
-  Animated, Linking, Platform, StyleSheet,
+  Animated, Platform, StyleSheet,
   Text, TouchableOpacity, View,
 } from 'react-native';
 import { SelectedDestination, RouteInfo, LatLng } from '../types/parking';
@@ -20,24 +20,10 @@ interface Props {
   onClose:           () => void;
 }
 
-export const SHEET_HEIGHT = 280;
+// Compact sheet — the destination card only needs the title, one distance line
+// and the Start Route button, so keep it short and low so it covers little map.
+export const SHEET_HEIGHT = 196;
 const ACCENT              = '#007AFF';
-
-function openInGoogleMaps(position: LatLng): void {
-  const { latitude, longitude } = position;
-  const nativeUrl = Platform.select({
-    ios:     `comgooglemaps://?daddr=${latitude},${longitude}&directionsmode=driving`,
-    android: `google.navigation:q=${latitude},${longitude}&mode=d`,
-  });
-  const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}&travelmode=driving`;
-  if (nativeUrl) {
-    Linking.canOpenURL(nativeUrl)
-      .then(ok => Linking.openURL(ok ? nativeUrl : webUrl))
-      .catch(() => Linking.openURL(webUrl));
-  } else {
-    Linking.openURL(webUrl);
-  }
-}
 
 const TYPE_ICON: Record<SelectedDestination['type'], string> = {
   parking: '🅿️',
@@ -113,14 +99,6 @@ export const RouteBottomSheet: React.FC<Props> = ({
               >
                 <Text style={styles.routeBtnText}>{startLabel}</Text>
               </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.gmapsBtn}
-                onPress={() => openInGoogleMaps(destination.position)}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.gmapsBtnText}>🗺 Open in Google Maps</Text>
-              </TouchableOpacity>
             </>
           ) : (
             <>
@@ -144,14 +122,6 @@ export const RouteBottomSheet: React.FC<Props> = ({
 
               <TouchableOpacity style={styles.cancelBtn} onPress={onCancelRoute} activeOpacity={0.85}>
                 <Text style={styles.cancelBtnText}>✕  Cancel Route</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.gmapsBtn, { marginTop: 8 }]}
-                onPress={() => openInGoogleMaps(destination.position)}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.gmapsBtnText}>🗺 Open in Google Maps</Text>
               </TouchableOpacity>
             </>
           )}

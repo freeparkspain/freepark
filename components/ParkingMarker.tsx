@@ -1,5 +1,5 @@
 import React, { memo, useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator, StyleSheet, Platform } from 'react-native';
+import { View, Text, StyleSheet, Platform } from 'react-native';
 import { Marker } from 'react-native-maps';
 import { OsmParking } from '../types/parking';
 import { isPaidParking } from '../utils/parking';
@@ -16,10 +16,9 @@ export const PAID_ACCENT      = '#F97316';
 export const PAID_ACCENT_DEEP = '#EA580C';
 
 interface Props {
-  parking:           OsmParking;
-  isSelected:        boolean;
-  isLoadingGeometry: boolean;
-  onPress:           (parking: OsmParking) => void;
+  parking:    OsmParking;
+  isSelected: boolean;
+  onPress:    (parking: OsmParking) => void;
 }
 
 // ─── Custom comparator ────────────────────────────────────────────────────────
@@ -27,8 +26,8 @@ interface Props {
 // (controls zIndex + size) and the parking identity.  Paid/free is derived
 // from the tags of a given id, which never change for that id, so the id check
 // already covers it.  All other prop churn — new `parking` reference on
-// re-fetch, `isLoadingGeometry` toggling, stable `onPress` — is ignored to keep
-// reconciliation O(1) per selection event instead of O(n) across the whole set.
+// re-fetch, stable `onPress` — is ignored to keep reconciliation O(1) per
+// selection event instead of O(n) across the whole set.
 function arePropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.isSelected  === next.isSelected &&
@@ -39,7 +38,7 @@ function arePropsEqual(prev: Props, next: Props): boolean {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 function ParkingMarkerBase({
-  parking, isSelected, isLoadingGeometry, onPress,
+  parking, isSelected, onPress,
 }: Props) {
   const paid = isPaidParking(parking.tags);
 
@@ -92,13 +91,11 @@ function ParkingMarkerBase({
               paid && (isSelected ? styles.badgePaidSelected : styles.badgePaid),
             ]}
           >
-            {isLoadingGeometry ? (
-              <ActivityIndicator size="small" color="#ffffff" />
-            ) : (
-              <Text style={[styles.glyph, isSelected && styles.glyphSelected]}>
-                {paid ? '€' : 'P'}
-              </Text>
-            )}
+            {/* Always the glyph — never a spinner. Loading is shown off-map by
+                the top GeometryLoadingBar, so markers never turn into spinners. */}
+            <Text style={[styles.glyph, isSelected && styles.glyphSelected]}>
+              {paid ? '€' : 'P'}
+            </Text>
           </View>
         </View>
       </View>

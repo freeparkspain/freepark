@@ -2,9 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { InteractionManager } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Region } from 'react-native-maps';
-import { fetchParkingData, fetchParkingGeometryBatch } from '../services/overpassService';
+import { fetchParkingGeometryBatch } from '../services/overpassService';
+import { defaultParkingDataProvider } from '../services/parking/parkingDataProvider';
 import { OsmParking } from '../types/parking';
 import { deltaToZoom } from '../utils/geo';
+import { PARKING_STORAGE_KEY, registerParkingCacheReset } from '../services/cache/parkingCache';
 
 export type { OsmParking } from '../types/parking';
 
@@ -25,12 +27,12 @@ const COVERAGE_THRESHOLD = 0.40;  // skip network fetch if ≥40% of viewport is
 const COOLDOWN_MS        = 5_000; // back-off window after HTTP 429
 
 const GEOMETRY_DEBOUNCE_MS = 350; // quiet time before batching visible-zone geometry requests
-const GEOMETRY_BATCH_LIMIT = 40;  // a close-zoom (≤2 km) viewport rarely holds more zones than this
+const GEOMETRY_BATCH_LIMIT = 18;  // smaller `out geom` batches complete within the geo timeout on flaky mirrors
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-/** AsyncStorage key — bump the suffix when the OsmParking shape changes. */
-const STORAGE_KEY = 'freepark_v1_parkings';
+/** AsyncStorage key — shared with the cache module (single source of truth). */
+const STORAGE_KEY = PARKING_STORAGE_KEY;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -215,6 +217,21 @@ export const useMapParkings = () => {
       .catch(err => console.warn('[useMapParkings] storage read:', err));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Cache-clear reset registration ─────────────────────────────────────────
+  // When the persistent parking cache is cleared, also drop the in-memory
+  // session caches and empty the rendered set — leaving the map in a clean,
+  // valid state. Navigation state lives elsewhere and is untouched.
+  useEffect(() => {
+    const unregister = registerParkingCacheReset(() => {
+      if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+      allParkings.clear();
+      fetchedRects.length = 0;
+      storageLoaded = false;
+      setParkings([]);
+    });
+    return unregister;
+  }, []);
+
   // ── Region fetch ──────────────────────────────────────────────────────────
   const loadForRegion = useCallback((region: Region) => {
 
@@ -273,7 +290,11 @@ export const useMapParkings = () => {
 
       setLoading(true);
       try {
-        const data = await fetchParkingData(south, west, north, east, ctrl.signal);
+        // Sourced through the ParkingDataProvider seam (Overpass today, a cached
+        // backend tomorrow) — see services/parking/parkingDataProvider.ts.
+        const data = await defaultParkingDataProvider.loadViewport(
+          { south, west, north, east }, ctrl.signal,
+        );
 
         console.log(`[useMapParkings] received ${data.length} elements from API`);
 
@@ -350,7 +371,10 @@ export const useMapParkings = () => {
         }
       } catch (err: unknown) {
         if (err instanceof Error && err.name === 'AbortError') return;
-        console.warn('[useMapParkings] zone geometry batch error:', err);
+        // Zone geometry is an optional enhancement (outline polygons). When the
+        // geo mirrors are unreachable the markers still work — so fail quietly
+        // and let the requested ids retry on a later pass, no error spam.
+        pending.forEach(id => geometryRequested.current.delete(id));
       }
     }, GEOMETRY_DEBOUNCE_MS);
   }, []);

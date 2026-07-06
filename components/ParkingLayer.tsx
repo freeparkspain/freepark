@@ -10,6 +10,7 @@ import {
   PARKING_ACCENT, PARKING_ACCENT_DEEP,
   PAID_ACCENT, PAID_ACCENT_DEEP,
 } from './ParkingMarker';
+import { SELECTED_ZONE, SELECTED_ZONE_PAID } from '../constants/parkingZoneTheme';
 
 // ─── Geometry styles ──────────────────────────────────────────────────────────
 // At rest, a park area is previewed as a single dashed *line* (its longest
@@ -32,14 +33,13 @@ const ZONE_LINE_PAID = { color: PAID_ACCENT,    width: 3, dash: [9, 7] };
 // enough to confirm "more parking this way" without competing for attention.
 const ZONE_LINE_DIM      = { color: 'rgba(0,122,255,0.28)', width: 2.5, dash: [6, 8] };
 const ZONE_LINE_DIM_PAID = { color: 'rgba(249,115,22,0.30)', width: 2.5, dash: [6, 8] };
-// Selected: the real zone — full contour, solidly filled. What the preview
-// line "becomes" once tapped.
-const SELECTED_ZONE      = { fill: 'rgba(0,122,255,0.26)',  stroke: PARKING_ACCENT_DEEP, width: 3 };
-const SELECTED_ZONE_PAID = { fill: 'rgba(249,115,22,0.24)', stroke: PAID_ACCENT_DEEP,    width: 3 };
-// Genuine OSM polylines (street_side / lane parking — already line-shaped in
-// the source data, unrelated to the zone-preview line above).
-const LINE      = { color: PARKING_ACCENT, width: 8 };
-const LINE_PAID = { color: PAID_ACCENT,    width: 8 };
+// Selected zone styles now live in the pure, unit-testable ../constants/
+// parkingZoneTheme module (see BUG 8) — imported above.
+// Genuine OSM polylines (street_side / lane parking). Blue (free) / orange
+// (paid) to match the markers. Only ever shown while browsing — never beside
+// the route (parking is hidden during navigation).
+const LINE      = { color: PARKING_ACCENT, width: 6 };
+const LINE_PAID = { color: PAID_ACCENT,    width: 6 };
 
 // ─── SelectedGeometryLayer ────────────────────────────────────────────────────
 // Isolated into its own memo'd component so that polygon load / unload events
@@ -180,16 +180,22 @@ const ZoneLine = memo(({ parking, dimmed, onPress }: {
 
 // ─── ParkingLayer ─────────────────────────────────────────────────────────────
 
+// Safety cap on simultaneously-rendered individual (non-clustered) markers.
+// Clustering normally keeps the on-screen count far below this; the cap only
+// guards against a pathological viewport trying to mount thousands at once.
+const MAX_INDIVIDUAL_MARKERS = 150;
+
 interface Props {
   parkings:          OsmParking[];
-  selectedParkingId: string | null;
+  /** Persistent snapshot of the selected parking (Bug 2) — rendered from this,
+   *  independent of clustering/viewport, so a small camera move can't hide it. */
+  selectedParking:   OsmParking | null;
   latitudeDelta:     number;
   viewportBounds:    BBox;
   onPressMarker:     (parking: OsmParking) => void;
   onPressCluster:    (position: LatLng) => void;
   selectedPolygon:   LatLng[] | null;
   selectedPolyline:  LatLng[] | null;
-  geometryLoading:   boolean;
   /**
    * True while the camera is zoomed in close enough (<= park-area radius
    * threshold, decided by MapScreen) to show detailed zone outlines. When
@@ -201,55 +207,45 @@ interface Props {
 
 export const ParkingLayer = memo(({
   parkings,
-  selectedParkingId,
+  selectedParking,
   latitudeDelta,
   viewportBounds,
   onPressMarker,
   onPressCluster,
   selectedPolygon,
   selectedPolyline,
-  geometryLoading,
   showZonePolygons,
 }: Props) => {
 
-  const clusterItems = useClustering(parkings, latitudeDelta, viewportBounds);
+  const selectedParkingId = selectedParking?.id ?? null;
 
-  // The Supercluster index only rebuilds when new spots arrive (count changes),
-  // not on geometry updates.  ZoneLine needs the LATEST polygon for each spot
-  // (to show the zone outline once geometry loads), so we build a fresh id→spot
-  // map from the `parkings` prop and use it for zone rendering.  O(n) map
-  // creation is far cheaper than a full Supercluster rebuild.
+  // Exclude the selected parking from clustering so it can NEVER be aggregated
+  // into a cluster bubble (which would hide its individual marker on a small
+  // pan/zoom). It is rendered separately, always-on, from the snapshot below.
+  const clusterInput = useMemo(
+    () => (selectedParkingId ? parkings.filter(p => p.id !== selectedParkingId) : parkings),
+    [parkings, selectedParkingId],
+  );
+
+  const clusterItems = useClustering(clusterInput, latitudeDelta, viewportBounds);
+
+  // Fresh id→spot map for ZoneLine geometry (see original note). Cheaper than a
+  // Supercluster rebuild.
   const parkingMap = useMemo(
     () => new Map(parkings.map(p => [p.id, p])),
     [parkings],
   );
 
-  // Is the currently-selected parking paid? Drives the orange vs blue zone
-  // styling so the selected polygon/line matches the marker's colour language.
-  const selectedParking = selectedParkingId ? parkingMap.get(selectedParkingId) : undefined;
-  const selectedPaid    = selectedParking ? isPaidParking(selectedParking.tags) : false;
+  const selectedPaid = selectedParking ? isPaidParking(selectedParking.tags) : false;
 
   return (
     <>
-      {/*
-       * Geometry is isolated in its own subtree.  When a polygon loads or
-       * clears, only SelectedGeometryLayer re-renders — the markers loop below
-       * is completely unaffected.
-       */}
-      <SelectedGeometryLayer
-        selectedParkingId={selectedParkingId}
-        polygon={selectedPolygon}
-        polyline={selectedPolyline}
-        visible={showZonePolygons}
-        paid={selectedPaid}
-      />
-
       {/* ── Zone outlines — individual (non-clustered) areas only, close zoom only ──
        * Once one zone is selected, the rest dim — see ZoneLine's `dimmed` doc.
        * Uses parkingMap (not item.data) so ZoneLine always gets fresh geometry.
        */}
       {showZonePolygons && clusterItems.map(item =>
-        item.type === 'parking' && item.data.id !== selectedParkingId
+        item.type === 'parking'
           ? (
             <ZoneLine
               key={`zone-${item.data.id}`}
@@ -261,19 +257,58 @@ export const ParkingLayer = memo(({
           : null,
       )}
 
-      {/* ── Markers / clusters ──────────────────────────────────────────────── */}
-      {clusterItems.map(item =>
-        item.type === 'cluster' ? (
-          <ClusterMarker key={item.id} item={item} onPress={onPressCluster} />
-        ) : (
-          <ParkingMarker
-            key={item.data.id}
-            parking={item.data}
-            isSelected={item.data.id === selectedParkingId}
-            isLoadingGeometry={item.data.id === selectedParkingId && geometryLoading}
-            onPress={onPressMarker}
-          />
-        ),
+      {/* ── Markers / clusters (selected parking excluded — rendered below) ────
+       * Individual markers are capped as a safety net: clustering already keeps
+       * the on-screen count small, but a pathological viewport must never try to
+       * mount thousands of native custom-view markers (jank / OOM). Clusters are
+       * always rendered; individual markers beyond MAX_INDIVIDUAL_MARKERS are
+       * dropped (the user zooms in to resolve them).
+       */}
+      {(() => {
+        let individualShown = 0;
+        return clusterItems.map(item => {
+          if (item.type === 'cluster') {
+            return <ClusterMarker key={item.id} item={item} onPress={onPressCluster} />;
+          }
+          if (individualShown >= MAX_INDIVIDUAL_MARKERS) return null;
+          individualShown++;
+          return (
+            <ParkingMarker
+              key={item.data.id}
+              parking={item.data}
+              isSelected={false}
+              onPress={onPressMarker}
+            />
+          );
+        });
+      })()}
+
+      {/* ── Selected parking — persistent overlay (Bug 2) ─────────────────────
+       * Rendered from the snapshot, ABOVE clusters, and its zone is NOT gated by
+       * showZonePolygons — so the selected marker + zone stay put through pan,
+       * zoom, rotate and tilt until the user selects another or closes it.
+       */}
+      {selectedParking && (
+        <SelectedGeometryLayer
+          // Key by the selected id so switching selection REMOUNTS the whole
+          // geometry subtree — this forces the old native Polygon/Polyline to
+          // unmount (react-native-maps/Google can otherwise leave a removed
+          // polygon on screen), fixing "the old zone doesn't always disappear".
+          key={`sel-geom-${selectedParking.id}`}
+          selectedParkingId={selectedParkingId}
+          polygon={selectedPolygon}
+          polyline={selectedPolyline}
+          visible
+          paid={selectedPaid}
+        />
+      )}
+      {selectedParking && (
+        <ParkingMarker
+          key={`selected-parking-${selectedParking.id}`}
+          parking={selectedParking}
+          isSelected
+          onPress={onPressMarker}
+        />
       )}
     </>
   );

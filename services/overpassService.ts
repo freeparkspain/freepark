@@ -65,9 +65,14 @@ let   bulkFastest: string | null = null;
 let   bulkFastestMs              = Infinity;
 
 // ── Geo pool (single-element / batched geometry) ──────────────────────────────
-const GEO_PER_MIRROR_MS   = 5_000;  // geometry queries are simple; 5 s is generous but avoids 8 s ANR
+// `out geom` for a batch of parking ways returns full polygon rings and is much
+// heavier than the `out center` bulk query — it legitimately needs longer than
+// the old 5 s (which timed out even on the mirror that answers bulk in <1 s).
+const GEO_PER_MIRROR_MS   = 12_000;
 const GEO_BLACKLIST_MS    = 10_000; // re-admit mirrors quickly — brief instability shouldn't lock for long
-const GEO_ALL_FAIL_COOLDOWN_MS = 10_000;
+// Geometry is a best-effort enhancement (zone outlines); when the whole geo
+// network is unreachable, back off for a while instead of retrying every search.
+const GEO_ALL_FAIL_COOLDOWN_MS = 45_000;
 const geoFailed           = new Map<string, number>();
 let   geoFastest: string | null = null;
 let   geoFastestMs               = Infinity;
@@ -223,7 +228,8 @@ async function fetchGeoParallel(
 
     const timer = setTimeout(() => {
       geoFailed.set(url, now + GEO_BLACKLIST_MS);
-      console.warn(`[overpassService] ${host} → geo timeout — blacklisted`);
+      // Geometry is best-effort — a flaky geo mirror is expected, not an error;
+      // don't spam the console (markers still work without zone outlines).
       ctrl.abort();
     }, GEO_PER_MIRROR_MS);
 
@@ -246,7 +252,7 @@ async function fetchGeoParallel(
         clearTimeout(timer);
         if (!(err instanceof Error && err.name === 'AbortError')) {
           geoFailed.set(url, now + GEO_BLACKLIST_MS);
-          console.warn(`[overpassService] ${host} →`, err);
+          // Best-effort geometry: keep the console quiet on expected geo failures.
         }
         throw err;
       });

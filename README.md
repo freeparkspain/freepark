@@ -10,10 +10,96 @@ A production-ready React Native (Expo) app to find and browse free parking spots
 | ---------- | ----------------------------------------- |
 | Framework  | React Native + Expo SDK 51                |
 | Language   | TypeScript (strict)                       |
-| Map        | react-native-maps + OpenStreetMap UrlTile |
+| Map        | react-native-maps (Google provider)       |
 | State      | Zustand                                   |
 | Navigation | React Navigation (Native Stack)           |
 | Styling    | NativeWind v4 (Tailwind CSS)              |
+| Routing    | OSRM (free/OSS) + polyline6               |
+| GPS        | expo-location (FusedLocationProvider)     |
+| Voice      | expo-speech (Android/iOS TTS)             |
+| Tests      | Jest + ts-jest (pure logic)               |
+
+---
+
+## Turn-by-Turn Navigation
+
+FreePark includes in-app turn-by-turn driving navigation built entirely on free
+/ open-source pieces — no paid SDK or paid routing API.
+
+- **Routing:** public OSRM (`https://router.project-osrm.org`) via `steps=true`
+  + `geometries=polyline6`. All UI/voice text is **English**.
+- **Guidance:** live GPS (expo-location), spoken maneuvers (expo-speech), automatic
+  off-route rerouting, and arrival detection.
+- **Start it:** pick any destination (parking marker / search result / long-press
+  pin / nearest-parking card), then press **Start Route** in the bottom sheet.
+
+### Module layout
+
+| File | Role |
+|---|---|
+| `types/navigation.ts` | Domain models + `NavigationState` machine + config |
+| `constants/navigation.ts` | `RoutingConfig` (OSRM base URL), tuning, voice stages |
+| `services/navigation/osrmApiService.ts` | OSRM HTTP client (timeout, abort, HTTPS) |
+| `services/navigation/osrmMapper.ts` | OSRM JSON → domain route (errors as `NavigationError`) |
+| `services/navigation/navigationRepository.ts` | Routing seam — swap OSRM for your own server |
+| `services/navigation/polyline.ts` | polyline6 encode/decode (precision 1e-6) |
+| `services/navigation/instructionGenerator.ts` | English maneuver phrasing |
+| `navigation/navigationEngine.ts` | Pure engine: progress, maneuver, off-route, arrival |
+| `navigation/rerouteController.ts` | Confirmations + cooldown reroute guard |
+| `navigation/locationProvider.ts` | `LocationProvider` (expo-location impl + fakeable interface) |
+| `navigation/voiceGuidanceManager.ts` | Staged English TTS (en-US → en-GB → en) |
+| `navigation/format.ts` | English distance / duration / ETA formatting |
+| `hooks/useNavigation.ts` | Orchestration "ViewModel" wiring it all together |
+| `components/NavigationPanel.tsx` | Top instruction card + bottom trip bar (safe-area) |
+
+### Changing the OSRM endpoint
+
+The public server is **development/testing only** (rate-limited, no SLA). For
+production, deploy your own OSRM (or a compatible free endpoint) and set:
+
+```bash
+# .env
+EXPO_PUBLIC_OSRM_BASE_URL=https://osrm.your-domain.com
+```
+
+No code changes are needed — `constants/navigation.ts` reads this env var and the
+`NavigationRepository` interface isolates the rest of the app from the provider.
+
+---
+
+## Parking data
+
+Parking is loaded per **viewport** (never city-wide) and pulled explicitly via the
+**Search Parking** button — pan/zoom never auto-fetches. Requests are
+latest-request-wins (`AbortController`), previously loaded spots stay visible while
+a refresh runs, and results are cached in memory + AsyncStorage
+(`freepark_v1_parkings`). Clearing is safe/idempotent via `clearParkingCache()`
+(`services/cache/parkingCache.ts`).
+
+The data source sits behind a **`ParkingDataProvider`** seam
+(`services/parking/parkingDataProvider.ts`) — today `OverpassParkingDataProvider`
+(public Overpass mirrors, dev/testing). Deterministic slippy-map tiles
+(`services/parking/parkingTiles.ts`) give stable viewport identity and gate
+over-large searches.
+
+### Production backend migration
+
+Public Overpass can't deliver Google-Maps latency at scale. For production, add a
+`BackendParkingDataProvider` implementing the same interface against a cached
+endpoint, e.g. `GET /api/parking?west&south&east&north&zoom`, backed by:
+PostGIS bounding-box queries + spatial index, a Redis/CDN tile cache with ETag +
+compression, result limits and stable de-duplication by `${type}:${id}`. Only
+`defaultParkingDataProvider` changes — the hook and UI are untouched. A
+vector-tile service is the ideal end state.
+
+---
+
+## Tests
+
+```bash
+npm test        # Jest — pure navigation + cache logic (no native modules)
+npx tsc --noEmit
+```
 
 ---
 

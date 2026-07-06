@@ -9,8 +9,13 @@ const R = 6_371_000; // радиус Земли в метрах
  *   zoom 14 → delta ≈ 0.022
  *   zoom 15 → delta ≈ 0.011
  */
-export const deltaToZoom = (latitudeDelta: number): number =>
-  Math.round(Math.log2(360 / latitudeDelta));
+export const deltaToZoom = (latitudeDelta: number): number => {
+  // Guard against 0 / negative / NaN deltas (seen transiently during camera
+  // animations) which would otherwise yield Infinity/NaN and crash consumers
+  // such as Supercluster's getClusters().
+  if (!(latitudeDelta > 0)) return 14;
+  return Math.round(Math.log2(360 / latitudeDelta));
+};
 
 /** Расстояние между двумя координатами в метрах (формула Haversine). */
 export const haversineDistance = (a: LatLng, b: LatLng): number => {

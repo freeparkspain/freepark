@@ -42,7 +42,9 @@ export const useGeometryLoader = () => {
       if (abortCtrl.current === ctrl) setGeometry(result);
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
-      console.warn('[useGeometryLoader]', err);
+      // Zone outline geometry is an optional enhancement. When the geo mirrors
+      // are down / on cooldown this fails expectedly — the marker + sheet still
+      // work, so fail quietly instead of spamming warnings.
     } finally {
       if (abortCtrl.current === ctrl) setGeometryLoading(false);
     }
