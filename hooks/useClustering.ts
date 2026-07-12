@@ -23,6 +23,13 @@ export type LayerItem = ClusterItem | ParkingItem;
 
 type PointProps = { parking: OsmParking };
 
+// Fraction of the viewport span added as a margin on each side before querying
+// Supercluster. Supercluster only returns points INSIDE the bbox, so an
+// un-padded viewport makes markers sitting exactly on the visible edge blink out
+// the moment the user pans or zooms. A margin keeps those boundary markers
+// rendered so icons don't disappear during map movement.
+const VIEWPORT_PAD_RATIO = 0.3;
+
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 //
 // Two-level memoisation:
@@ -98,7 +105,17 @@ export const useClustering = (
     // skip this frame safely — the next valid region re-queries.
     if (![west, south, east, north].every(Number.isFinite)) return [];
 
-    const bbox: [number, number, number, number] = [west, south, east, north];
+    // Pad the query bbox so markers on the visible edge stay rendered through a
+    // pan/zoom (see VIEWPORT_PAD_RATIO). Clamp to valid lat/lon so an extreme
+    // viewport can't hand Supercluster an out-of-range bbox.
+    const padLon = (east - west) * VIEWPORT_PAD_RATIO;
+    const padLat = (north - south) * VIEWPORT_PAD_RATIO;
+    const bbox: [number, number, number, number] = [
+      Math.max(-180, west  - padLon),
+      Math.max(-90,  south - padLat),
+      Math.min(180,  east  + padLon),
+      Math.min(90,   north + padLat),
+    ];
 
     return index.getClusters(bbox, zoom).map(feature => {
       const [lon, lat] = feature.geometry.coordinates;

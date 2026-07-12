@@ -42,8 +42,9 @@ import { useNavigationCamera } from "../hooks/useNavigationCamera";
 import { useParkingStore } from "../store/useParkingStore";
 import { OsmParking, LatLng, BBox, RouteInfo, SelectedDestination } from "../types/parking";
 import { MAPS_APIKEY, NAVIGATION_PROVIDER } from "../constants/maps";
-import { viewportRadiusMeters, haversineDistance, deltaToZoom, simplifyCoords } from "../utils/geo";
-import { isPaidParking } from "../utils/parking";
+import { haversineDistance, deltaToZoom, simplifyCoords } from "../utils/geo";
+import { isPaidParking, parkingName } from "../utils/parking";
+import { ParkingLod, getParkingLod } from "../constants/parkingLod";
 import {
   getVisibleTileIds,
   getParkingDataZoom,
@@ -59,7 +60,6 @@ export const MALAGA_REGION = {
 
 const RECENTER_BOTTOM_DEFAULT    = 40;
 const RECENTER_LIFT_MARGIN       = 12;
-const PARK_AREA_RADIUS_LIMIT_M   = 2_000;
 const NEARBY_SUGGESTION_RADIUS_M = 1_500;
 const SUGGESTION_RECOMPUTE_THRESHOLD_M = 80;
 // Below this zoom, parking markers hide entirely (Google-Maps-like) — even
@@ -72,6 +72,15 @@ const PARKING_MIN_VISIBLE_ZOOM   = 12;
 // Stable empty array so gating parking off doesn't allocate a new reference
 // every render (which would thrash the Supercluster index memo downstream).
 const EMPTY_PARKINGS: OsmParking[] = [];
+// Stable map padding for browsing. A NEW object literal each render made
+// react-native-maps re-apply padding on every re-render; on iOS Google Maps
+// that repeatedly reconfigures the map and drops the native blue "my location"
+// dot (the "disappears after a few Search Parking presses" bug). A constant
+// reference means the native map is never reconfigured by unrelated re-renders.
+const BROWSING_MAP_PADDING = { top: 120, right: 0, bottom: 0, left: 0 };
+// Window (ms) after a marker tap during which a map-press for the SAME physical
+// tap (iOS fires both) is ignored — deterministic, unlike frame timing.
+const MARKER_TAP_GUARD_MS = 350;
 // Stable empty route coords for the car-tracking hook when not navigating.
 const NO_COORDS: LatLng[] = [];
 
@@ -108,6 +117,10 @@ export const MapScreen: React.FC = () => {
   // ── Turn-by-turn navigation (OSRM + expo-location + expo-speech) ─────────────
   const nav = useNavigation();
   const navActive = nav.isActive;
+  // Live mirror of `nav` so the stable marker-tap handler can read it without
+  // taking `nav` as a dependency (which would recreate the handler each render).
+  const navRef = useRef(nav);
+  navRef.current = nav;
 
   // Hide the app header while navigating so the instruction card can sit at the
   // top safe area and the map gets maximum room (BUG 7). Restored on exit.
@@ -123,6 +136,10 @@ export const MapScreen: React.FC = () => {
   // Guard: Marker.onPress and MapView.onPress both fire for the same physical tap
   // on iOS. We set this flag inside handlePressParkingZone so handleMapPress can bail.
   const markerJustTappedRef = useRef(false);
+  // Timestamp of the last marker tap — a deterministic window (MARKER_TAP_GUARD_MS)
+  // so the map-press for the same physical tap can't cancel a fresh selection even
+  // if it arrives a frame or two late (the old requestAnimationFrame flag raced it).
+  const markerTapAtRef      = useRef(0);
   // Prevents multiple rapid taps from queuing simultaneous geometry fetches.
   const isProcessingRef     = useRef(false);
   // True while the user has an active pinch/pan gesture on the map (set on
@@ -164,6 +181,11 @@ export const MapScreen: React.FC = () => {
   // ── OSM parking zone state ────────────────────────────────────────────────────
   const [latDelta,          setLatDelta]          = useState(MALAGA_REGION.latitudeDelta);
   const [viewportBounds,    setViewportBounds]    = useState<BBox>(() => regionToBBox(MALAGA_REGION));
+  // Parking-zone Level of Detail for the settled camera — updated only on
+  // onRegionChangeComplete (not per frame) with hysteresis so a zoom hovering on
+  // a threshold doesn't flicker. Drives ParkingLayer's geometry rendering and
+  // the on-demand geometry fetch. See constants/parkingLod.
+  const [lod,               setLod]               = useState<ParkingLod>('low');
   // Keep the ref in sync so handlePressCluster can read the current bounds
   // without capturing viewportBounds in its deps (which would recreate the
   // callback — and re-render every ClusterMarker — on every pan event).
@@ -174,6 +196,10 @@ export const MapScreen: React.FC = () => {
   // source of truth; the id is derived, never stored separately.
   const [selectedParking, setSelectedParking] = useState<OsmParking | null>(null);
   const selectedParkingId = selectedParking?.id ?? null;
+  // Live mirror so the stable marker-tap handler can detect a re-tap on the
+  // already-selected parking (toggle-off) without depending on selection state.
+  const selectedParkingIdRef = useRef<string | null>(null);
+  selectedParkingIdRef.current = selectedParkingId;
   const [activeRoute,         setActiveRoute]         = useState(false);
   const [routeInfo,           setRouteInfo]           = useState<RouteInfo | null>(null);
   const [routeError,          setRouteError]          = useState<string | null>(null);
@@ -281,8 +307,6 @@ export const MapScreen: React.FC = () => {
 
   const canNavigate = NAVIGATION_PROVIDER === 'osrm' || MAPS_APIKEY.length > 0;
 
-  const showZonePolygons = viewportRadiusMeters(viewportBounds) <= PARK_AREA_RADIUS_LIMIT_M;
-
   const recenterLift = Math.max(
     keyboardHeight      > 0 ? keyboardHeight   + RECENTER_LIFT_MARGIN : 0,
     selectedDestination     ? SHEET_HEIGHT     + RECENTER_LIFT_MARGIN : 0,
@@ -360,6 +384,22 @@ export const MapScreen: React.FC = () => {
     }
   }, [userLocation]);
 
+  // Single source of truth for clearing the current parking/destination
+  // selection and any route state built for it. One stable helper used by the
+  // map-press, the close control, the re-tap toggle, the filter and the
+  // "selection no longer exists" guard — so the selected marker, selected zone,
+  // selected paid parking and the info sheet can never drift out of sync.
+  const clearSelection = useCallback(() => {
+    osrmFetchIdRef.current++;
+    setSelectedParking(null);
+    setSelectedDestination(null);
+    setActiveRoute(false);
+    setRouteInfo(null);
+    setRouteError(null);
+    setOsrmPolyline(null);
+    clearGeometry();
+  }, [clearGeometry]);
+
   // Driving aid: throttled "nearest parking" scan.
   // Scans visibleParkings (the filtered set) so a driver on "Free Only" is
   // never steered toward a paid spot the map itself is hiding. Re-scans only
@@ -394,14 +434,14 @@ export const MapScreen: React.FC = () => {
     );
   }, [navActive, userLocation, visibleParkings]);
 
-  // Once parking is displayed AND the camera is close enough to show zone
-  // outlines, fetch full ring geometry for the on-screen zones that don't have
-  // it yet — in one batched request. Gated by parkingVisible so it never fires
-  // while markers are hidden (no display = no geometry pulls). Iterates the
-  // filtered `visibleParkings` so paid zones aren't fetched while on Free Only.
+  // Once parking is displayed AND the LOD calls for zone outlines (medium/high),
+  // fetch full ring geometry for the on-screen zones that don't have it yet — in
+  // one batched request. Gated by parkingVisible so it never fires while markers
+  // are hidden (no display = no geometry pulls). Iterates the filtered
+  // `visibleParkings` so paid zones aren't fetched while on Free Only.
   useEffect(() => {
-    // No parking is drawn during navigation, so never pull zone geometry then.
-    if (navActive || !parkingVisible || !showZonePolygons) return;
+    // No parking is drawn during navigation, and low LOD draws no outlines.
+    if (navActive || !parkingVisible || lod === 'low') return;
     const visibleIds = visibleParkings
       .filter(p =>
         !p.polygon && !p.polyline &&
@@ -410,27 +450,25 @@ export const MapScreen: React.FC = () => {
       )
       .map(p => p.id);
     if (visibleIds.length) loadZoneGeometry(visibleIds);
-  }, [navActive, parkingVisible, showZonePolygons, visibleParkings, viewportBounds, loadZoneGeometry]);
+  }, [navActive, parkingVisible, lod, visibleParkings, viewportBounds, loadZoneGeometry]);
 
-  // Free Only just hid the selected paid parking — clear its selection, geometry
-  // and any route targeting it so nothing points at a spot that's no longer
-  // renderable (the stale selected-id + geometry was the filter-toggle crash).
-  // Source data/cache is untouched; toggling back to All Parking restores it.
-  // Looks the spot up in the FULL source `parkings`, since by now it's already
-  // been filtered out of `visibleParkings`.
+  // Free Only just hid the selected paid parking — clear the whole selection so
+  // nothing points at a spot the filter no longer renders (the stale selected-id
+  // + geometry was the filter-toggle crash). Source data/cache is untouched;
+  // toggling back to All Parking simply lets it be re-selected.
   useEffect(() => {
     if (!filterOnlyFree || !selectedParking) return;
     if (!isPaidParking(selectedParking.tags)) return; // snapshot carries the tags
-    setSelectedParking(null);
-    clearGeometry();
-    setSelectedDestination(prev =>
-      prev && prev.type === 'parking' && prev.id === selectedParkingId ? null : prev);
-    osrmFetchIdRef.current++;
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
-  }, [filterOnlyFree, selectedParking, selectedParkingId, clearGeometry]);
+    clearSelection();
+  }, [filterOnlyFree, selectedParking, clearSelection]);
+
+  // Guard: if the selected parking is no longer present in the canonical dataset
+  // (e.g. the parking cache was cleared), drop the stale selection so the sheet
+  // and highlight never reference a spot that doesn't exist anymore.
+  useEffect(() => {
+    if (!selectedParking) return;
+    if (!parkings.some(p => p.id === selectedParking.id)) clearSelection();
+  }, [parkings, selectedParking, clearSelection]);
 
   // Keyboard listeners: lift the recenter button above the keyboard while it is open.
   useEffect(() => {
@@ -464,6 +502,10 @@ export const MapScreen: React.FC = () => {
     lastRegionRef.current = region;
     setLatDelta(region.latitudeDelta);
     setViewportBounds(regionToBBox(region));
+    // Recompute the parking-zone LOD from the settled zoom, carrying the previous
+    // level so a zoom sitting on a threshold doesn't flip back and forth
+    // (hysteresis lives in getParkingLod). Settled-region only — never per frame.
+    setLod(prev => getParkingLod(region.latitudeDelta, prev));
     // Parking display is scoped to the captured search zone and is intentionally
     // NOT cleared on pan/zoom, so the searched parkings never vanish when the map
     // moves. A fresh "Search Parking" press re-scopes to the new viewport.
@@ -512,19 +554,16 @@ export const MapScreen: React.FC = () => {
     isGesturingRef.current = true;
   }, []);
 
-  // Map tap: clears all selections and route state.
+  // Map tap on an empty area: clears the selection, pins and route state.
+  // Ignores the map-press that iOS fires for the SAME physical tap as a marker
+  // press — both the immediate flag and a deterministic time window, so a
+  // fresh selection can't be cancelled by its own tap (Problem 4).
   const handleMapPress = useCallback(() => {
-    if (markerJustTappedRef.current) return;
+    if (markerJustTappedRef.current || Date.now() - markerTapAtRef.current < MARKER_TAP_GUARD_MS) return;
     setDroppedPin(null);
     setSearchPin(null);
-    setSelectedDestination(null);
-    setSelectedParking(null);
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
-    clearGeometry();
-  }, [clearGeometry]);
+    clearSelection();
+  }, [clearSelection]);
 
   // Long-press: drops a pin, sets it as navigation destination, reverse-geocodes address.
   const handleLongPress = useCallback(async (e: LongPressEvent) => {
@@ -595,20 +634,34 @@ export const MapScreen: React.FC = () => {
     [clearGeometry],
   );
 
-  // OSM parking zone marker tapped: triggers geometry fetch and bottom sheet.
+  // OSM parking marker (free "P" or paid "€") tapped: selects it and opens the
+  // info sheet, re-tapping the selected one toggles it off. Stable identity — it
+  // reads nav + the selected id from refs, so it never needs to be recreated
+  // (which would otherwise churn every marker/outline that takes it as onPress).
   const handlePressParkingZone = useCallback((parking: OsmParking) => {
     if (isProcessingRef.current || isGesturingRef.current) return;
     isProcessingRef.current = true;
     setTimeout(() => { isProcessingRef.current = false; }, 500);
 
+    // Deterministic guard so the map-press for this same physical tap can't clear
+    // the selection we're about to set (Problem 4).
     markerJustTappedRef.current = true;
+    markerTapAtRef.current = Date.now();
     requestAnimationFrame(() => { markerJustTappedRef.current = false; });
 
+    const navigation = navRef.current;
     // Already navigating? Tapping a parking immediately re-routes to it — no
     // need to leave navigation to pick the next destination.
-    if (nav.isActive) {
+    if (navigation.isActive) {
       console.log('[MapScreen] reroute to tapped parking during navigation:', parking.id);
-      nav.start(parking.position);
+      navigation.start(parking.position);
+      return;
+    }
+
+    // Re-tap on the already-selected parking → toggle the selection off.
+    if (selectedParkingIdRef.current === parking.id) {
+      console.log('[MapScreen] parking re-tapped — clearing selection:', parking.id);
+      clearSelection();
       return;
     }
 
@@ -617,7 +670,7 @@ export const MapScreen: React.FC = () => {
     const dest: SelectedDestination = {
       id:       parking.id,
       type:     'parking',
-      title:    parking.tags.name ?? parking.tags['name:en'] ?? parking.tags['name:ru'] ?? 'Parking',
+      title:    parkingName(parking),
       position: parking.position,
     };
     setSelectedParking(parking);
@@ -628,8 +681,8 @@ export const MapScreen: React.FC = () => {
     setOsrmPolyline(null);
     loadGeometry(parking);
 
-    console.log('[MapScreen] navigation sheet opening for parking:', dest.title);
-  }, [loadGeometry, nav]);
+    console.log('[MapScreen] info sheet opening for parking:', dest.title);
+  }, [loadGeometry, clearSelection]);
 
   // Long-press WHILE navigating → drop a new destination and reroute instantly,
   // so the driver can chain to a next stop without leaving navigation.
@@ -693,17 +746,10 @@ export const MapScreen: React.FC = () => {
   }, []);
 
   const handleCloseSheet = useCallback(() => {
-    osrmFetchIdRef.current++;
-    setSelectedDestination(null);
-    setSelectedParking(null);
+    clearSelection();
     setSearchPin(null);
     setDroppedPin(null);
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
-    clearGeometry();
-  }, [clearGeometry]);
+  }, [clearSelection]);
 
   return (
     <View style={styles.container}>
@@ -723,7 +769,10 @@ export const MapScreen: React.FC = () => {
         onPanDrag={navActive ? camera.enterFreeMode : undefined}
         onRegionChange={handleRegionChange}
         onRegionChangeComplete={handleRegionChangeComplete}
-        mapPadding={navActive ? camera.mapPadding : { top: 120, right: 0, bottom: 0, left: 0 }}
+        // Stable reference while browsing (BROWSING_MAP_PADDING) — a fresh object
+        // each render made iOS Google Maps re-apply padding and drop the native
+        // user-location dot after a few searches (Problem 3).
+        mapPadding={navActive ? camera.mapPadding : BROWSING_MAP_PADDING}
       >
         {/* OSM parking clusters/markers + selected zone. Hidden entirely during
             active navigation (parkingForMap / selectedForMap go empty) so the
@@ -737,7 +786,7 @@ export const MapScreen: React.FC = () => {
           onPressCluster={handlePressCluster}
           selectedPolygon={geometry?.polygon ?? null}
           selectedPolyline={geometry?.polyline ?? null}
-          showZonePolygons={showZonePolygons}
+          lod={lod}
         />
 
         {/* ── Active turn-by-turn navigation overlays ─────────────────────────── */}
@@ -921,6 +970,11 @@ export const MapScreen: React.FC = () => {
           {/* Universal destination + routing bottom sheet */}
           <RouteBottomSheet
             destination={selectedDestination}
+            parkingPaid={
+              selectedDestination?.type === 'parking' && selectedParking
+                ? isPaidParking(selectedParking.tags)
+                : null
+            }
             activeRoute={activeRoute}
             routeInfo={routeInfo}
             userLocation={userLocation}

@@ -8,6 +8,9 @@ import { formatDistance, formatDuration, haversineDistance } from '../utils/geo'
 
 interface Props {
   destination:       SelectedDestination | null;
+  /** Paid/free status for a parking destination (null when N/A). Surfaces the
+   *  existing OSM fee classification in the info sheet. */
+  parkingPaid?:      boolean | null;
   activeRoute:       boolean;
   routeInfo:         RouteInfo | null;
   userLocation:      LatLng | null;
@@ -32,7 +35,7 @@ const TYPE_ICON: Record<SelectedDestination['type'], string> = {
 };
 
 export const RouteBottomSheet: React.FC<Props> = ({
-  destination, activeRoute, routeInfo, userLocation, canNavigate, routeError,
+  destination, parkingPaid, activeRoute, routeInfo, userLocation, canNavigate, routeError,
   locationDenied, onStartRoute, onCancelRoute, onRequestLocation, onClose,
 }) => {
   const translateY = useRef(new Animated.Value(SHEET_HEIGHT)).current;
@@ -74,6 +77,16 @@ export const RouteBottomSheet: React.FC<Props> = ({
               <Text style={styles.closeIcon}>✕</Text>
             </TouchableOpacity>
           </View>
+
+          {/* Paid/free badge — only for parking destinations, from existing OSM
+              tags (no invented data). Blue = free, orange = paid (matches map). */}
+          {destination.type === 'parking' && parkingPaid != null && (
+            <View style={[styles.parkingBadge, parkingPaid ? styles.parkingBadgePaid : styles.parkingBadgeFree]}>
+              <Text style={[styles.parkingBadgeText, parkingPaid ? styles.parkingBadgeTextPaid : styles.parkingBadgeTextFree]}>
+                {parkingPaid ? '€ Paid parking' : 'P Free parking'}
+              </Text>
+            </View>
+          )}
 
           {!activeRoute ? (
             <>
@@ -162,6 +175,16 @@ const styles = StyleSheet.create({
   title:     { flex: 1, fontSize: 15, fontWeight: '700', color: '#111827' },
   closeIcon: { fontSize: 16, color: '#9CA3AF', paddingLeft: 8 },
   distance:  { fontSize: 13, color: '#6B7280', marginBottom: 10 },
+  parkingBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 8, paddingVertical: 3, paddingHorizontal: 8,
+    marginBottom: 8,
+  },
+  parkingBadgeFree: { backgroundColor: '#DBEAFE' },
+  parkingBadgePaid: { backgroundColor: '#FFEDD5' },
+  parkingBadgeText: { fontSize: 12, fontWeight: '700' },
+  parkingBadgeTextFree: { color: '#1D4ED8' },
+  parkingBadgeTextPaid: { color: '#C2410C' },
   locationHint: {
     fontSize: 13, color: '#92400E', marginBottom: 10,
     backgroundColor: '#FEF3C7', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10,

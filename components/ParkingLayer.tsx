@@ -3,8 +3,9 @@ import { View, Text, StyleSheet, Platform } from 'react-native';
 import { Marker, Polygon, Polyline } from 'react-native-maps';
 import { OsmParking, LatLng, BBox } from '../types/parking';
 import { useClustering, ClusterItem } from '../hooks/useClustering';
-import { longestEdge } from '../utils/geo';
 import { isPaidParking } from '../utils/parking';
+import { ParkingLod, ZONE_SIMPLIFY_TOLERANCE_M } from '../constants/parkingLod';
+import { simplifiedZoneGeometry } from '../utils/parkingGeometry';
 import {
   ParkingMarker,
   PARKING_ACCENT, PARKING_ACCENT_DEEP,
@@ -13,31 +14,20 @@ import {
 import { SELECTED_ZONE, SELECTED_ZONE_PAID } from '../constants/parkingZoneTheme';
 
 // ─── Geometry styles ──────────────────────────────────────────────────────────
-// At rest, a park area is previewed as a single dashed *line* (its longest
-// edge — see longestEdge) rather than its full rectangular outline, which for
-// these long, narrow road-side bays reads as a "box" rather than a stripe.
-// Tapping the icon swaps the preview line for the actual filled zone.
+// Parking-zone boundaries are drawn as CONTINUOUS SOLID lines (no dashes) so a
+// bay outline reads as one shape instead of broken segments. Everything
+// parking-related — badge, zone outline, filled selected zone, clusters — shares
+// one accent family (blue = free, orange = paid) so the whole layer reads as a
+// single visual language rather than a patchwork of one-off colours.
 //
-// Everything parking-related — badge, preview line, filled zone, clusters —
-// shares one accent (PARKING_ACCENT). One colour family means a driver can
-// tell "that's parking" at a glance instead of decoding a patchwork of
-// one-off colours. Consistency *is* the decluttering: the eye learns one
-// signal instead of several.
-
-// At-rest preview: a thin dashed line tracing the area's longest edge.
-// Paid zones use the same warm orange as the paid marker so a driver reads one
-// consistent "this costs money" signal across marker + zone. Free stays blue.
-const ZONE_LINE      = { color: PARKING_ACCENT, width: 3, dash: [9, 7] };
-const ZONE_LINE_PAID = { color: PAID_ACCENT,    width: 3, dash: [9, 7] };
-// Once another zone is selected, the rest fade to a faint trace — present
-// enough to confirm "more parking this way" without competing for attention.
-const ZONE_LINE_DIM      = { color: 'rgba(0,122,255,0.28)', width: 2.5, dash: [6, 8] };
-const ZONE_LINE_DIM_PAID = { color: 'rgba(249,115,22,0.30)', width: 2.5, dash: [6, 8] };
-// Selected zone styles now live in the pure, unit-testable ../constants/
-// parkingZoneTheme module (see BUG 8) — imported above.
-// Genuine OSM polylines (street_side / lane parking). Blue (free) / orange
-// (paid) to match the markers. Only ever shown while browsing — never beside
-// the route (parking is hidden during navigation).
+// Non-selected zone outline: solid stroke, no fill, so many on-screen zones stay
+// legible without muddying the map. Free = blue, paid = orange (matches marker).
+const ZONE_OUTLINE      = { stroke: PARKING_ACCENT, width: 3 };
+const ZONE_OUTLINE_PAID = { stroke: PAID_ACCENT,    width: 3 };
+// Selected zone styles live in the pure, unit-testable ../constants/
+// parkingZoneTheme module — imported above (stronger fill, still a solid stroke).
+// Genuine OSM polylines (street_side / lane parking) for the SELECTED zone. Blue
+// (free) / orange (paid) to match the markers.
 const LINE      = { color: PARKING_ACCENT, width: 6 };
 const LINE_PAID = { color: PAID_ACCENT,    width: 6 };
 
@@ -131,52 +121,68 @@ const ClusterMarker = memo(({ item, onPress }: {
   prev.item.id    === next.item.id &&
   prev.item.count === next.item.count);
 
-// ─── Zone preview line (at-rest, unselected park areas) ───────────────────────
-// Rendered only for individual (non-clustered) zones once the camera is close
-// enough — see `showZonePolygons`. Previews each area as a single dashed line
-// along its longest edge (longestEdge) — NOT its full rectangular outline,
-// which for these long, narrow road-side bays reads as a "box" rather than a
-// stripe. Tapping the icon swaps this preview for the actual filled zone (via
-// SelectedGeometryLayer, which is why the selected zone is skipped here).
-//
-// `tappable` keeps the line itself a touch target too, alongside the badge —
-// a forgiving way to select a long, thin shape without aiming for its centre.
-//
-// `dimmed` — true once *any* zone is selected elsewhere on screen. Fading the
-// rest to a faint trace (ZONE_LINE_DIM) is the actual answer to "make it less
-// cluttered": rather than showing every zone at full strength all the time,
-// only the one the driver is interacting with stays crisp; the others remain
-// just visible enough to say "parking continues this way" without competing.
+// ─── Zone outline (LOD: medium = simplified, high = full) ─────────────────────
+// Renders an individual (non-clustered) park area's boundary as a SOLID line —
+// a fill-less Polygon for a valid closed ring, a Polyline for open geometry.
+// At medium zoom the geometry is simplified (cached RDP — see
+// simplifiedZoneGeometry) to cut vertex counts; at high zoom the full ring is
+// drawn. The line stays tappable so a long, thin bay can be selected without
+// aiming for the tiny badge at its centre. The SELECTED zone is drawn separately
+// (SelectedGeometryLayer) and is excluded from this loop via clusterInput.
 
-const ZoneLine = memo(({ parking, dimmed, onPress }: {
-  parking: OsmParking;
-  dimmed:  boolean;
-  onPress: (parking: OsmParking) => void;
+const ZoneOutline = memo(({ parking, simplified, onPress }: {
+  parking:    OsmParking;
+  simplified: boolean;
+  onPress:    (parking: OsmParking) => void;
 }) => {
-  if (!parking.polygon) return null;
-  const edge = longestEdge(parking.polygon);
-  if (!edge) return null;
   const paid  = isPaidParking(parking.tags);
-  const style = dimmed
-    ? (paid ? ZONE_LINE_DIM_PAID : ZONE_LINE_DIM)
-    : (paid ? ZONE_LINE_PAID     : ZONE_LINE);
-  return (
-    <Polyline
-      key={`zone-line-${parking.id}`}
-      coordinates={edge}
-      strokeColor={style.color}
-      strokeWidth={style.width}
-      lineDashPattern={style.dash}
-      lineCap="round"
-      zIndex={1}
-      tappable
-      onPress={() => onPress(parking)}
-    />
-  );
+  const style = paid ? ZONE_OUTLINE_PAID : ZONE_OUTLINE;
+
+  // Prefer a closed polygon ring; fall back to an open polyline.
+  if (parking.polygon && parking.polygon.length >= 4) {
+    const coords = simplified
+      ? simplifiedZoneGeometry(parking.polygon, ZONE_SIMPLIFY_TOLERANCE_M, 4)
+      : parking.polygon;
+    return (
+      <Polygon
+        coordinates={coords}
+        strokeColor={style.stroke}
+        strokeWidth={style.width}
+        fillColor="rgba(0,0,0,0)"
+        lineJoin="round"
+        lineCap="round"
+        tappable
+        onPress={() => onPress(parking)}
+        zIndex={1}
+      />
+    );
+  }
+  if (parking.polyline && parking.polyline.length >= 2) {
+    const coords = simplified
+      ? simplifiedZoneGeometry(parking.polyline, ZONE_SIMPLIFY_TOLERANCE_M, 2)
+      : parking.polyline;
+    return (
+      <Polyline
+        coordinates={coords}
+        strokeColor={style.stroke}
+        strokeWidth={style.width}
+        lineCap="round"
+        lineJoin="round"
+        tappable
+        onPress={() => onPress(parking)}
+        zIndex={1}
+      />
+    );
+  }
+  return null;
 }, (prev, next) =>
-  prev.parking.id === next.parking.id &&
-  prev.dimmed     === next.dimmed &&
-  prev.onPress    === next.onPress);
+  // Visual output depends only on identity, geometry reference and the
+  // simplified flag — NOT onPress (excluded so a new handler ref never forces an
+  // O(zones) native reconcile; the handler reads live state via refs upstream).
+  prev.parking.id       === next.parking.id &&
+  prev.parking.polygon  === next.parking.polygon &&
+  prev.parking.polyline === next.parking.polyline &&
+  prev.simplified       === next.simplified);
 
 // ─── ParkingLayer ─────────────────────────────────────────────────────────────
 
@@ -184,6 +190,9 @@ const ZoneLine = memo(({ parking, dimmed, onPress }: {
 // Clustering normally keeps the on-screen count far below this; the cap only
 // guards against a pathological viewport trying to mount thousands at once.
 const MAX_INDIVIDUAL_MARKERS = 150;
+// Independent cap for zone outlines (only zones that actually carry geometry are
+// ever drawn, so this rarely bites — it just bounds the worst case).
+const MAX_ZONE_OUTLINES = 120;
 
 interface Props {
   parkings:          OsmParking[];
@@ -197,12 +206,13 @@ interface Props {
   selectedPolygon:   LatLng[] | null;
   selectedPolyline:  LatLng[] | null;
   /**
-   * True while the camera is zoomed in close enough (<= park-area radius
-   * threshold, decided by MapScreen) to show detailed zone outlines. When
-   * false, only markers/clusters render — outlines hide until the user zooms
-   * back in, keeping the far-out view to clean clustered icons.
+   * Level of Detail for zone geometry (centralised in constants/parkingLod):
+   *   'low'    → markers/clusters only, no zone outlines
+   *   'medium' → simplified, solid zone outlines
+   *   'high'   → full-resolution solid zone outlines
+   * Markers always render at every level — LOD only switches the geometry.
    */
-  showZonePolygons:  boolean;
+  lod: ParkingLod;
 }
 
 export const ParkingLayer = memo(({
@@ -214,7 +224,7 @@ export const ParkingLayer = memo(({
   onPressCluster,
   selectedPolygon,
   selectedPolyline,
-  showZonePolygons,
+  lod,
 }: Props) => {
 
   const selectedParkingId = selectedParking?.id ?? null;
@@ -229,7 +239,8 @@ export const ParkingLayer = memo(({
 
   const clusterItems = useClustering(clusterInput, latitudeDelta, viewportBounds);
 
-  // Fresh id→spot map for ZoneLine geometry (see original note). Cheaper than a
+  // Fresh id→spot map so ZoneOutline always reads the latest geometry for an id
+  // (the cluster index can hold an older parking object). Cheaper than a
   // Supercluster rebuild.
   const parkingMap = useMemo(
     () => new Map(parkings.map(p => [p.id, p])),
@@ -240,22 +251,30 @@ export const ParkingLayer = memo(({
 
   return (
     <>
-      {/* ── Zone outlines — individual (non-clustered) areas only, close zoom only ──
-       * Once one zone is selected, the rest dim — see ZoneLine's `dimmed` doc.
-       * Uses parkingMap (not item.data) so ZoneLine always gets fresh geometry.
+      {/* ── Zone outlines — individual (non-clustered) areas, medium/high LOD ──
+       * Solid boundaries (no dashes). Simplified at medium zoom, full at high;
+       * skipped entirely at low zoom (markers only). Uses parkingMap (not
+       * item.data) so the outline always gets fresh geometry. The selected zone
+       * is drawn separately below and excluded from clustering. Capped as a
+       * safety net against a pathological viewport.
        */}
-      {showZonePolygons && clusterItems.map(item =>
-        item.type === 'parking'
-          ? (
-            <ZoneLine
-              key={`zone-${item.data.id}`}
-              parking={parkingMap.get(item.data.id) ?? item.data}
-              dimmed={!!selectedParkingId}
+      {lod !== 'low' && (() => {
+        let shown = 0;
+        return clusterItems.map(item => {
+          if (item.type !== 'parking') return null;
+          const p = parkingMap.get(item.data.id) ?? item.data;
+          if ((!p.polygon && !p.polyline) || shown >= MAX_ZONE_OUTLINES) return null;
+          shown++;
+          return (
+            <ZoneOutline
+              key={`zone-${p.id}`}
+              parking={p}
+              simplified={lod === 'medium'}
               onPress={onPressMarker}
             />
-          )
-          : null,
-      )}
+          );
+        });
+      })()}
 
       {/* ── Markers / clusters (selected parking excluded — rendered below) ────
        * Individual markers are capped as a safety net: clustering already keeps
@@ -285,8 +304,8 @@ export const ParkingLayer = memo(({
 
       {/* ── Selected parking — persistent overlay (Bug 2) ─────────────────────
        * Rendered from the snapshot, ABOVE clusters, and its zone is NOT gated by
-       * showZonePolygons — so the selected marker + zone stay put through pan,
-       * zoom, rotate and tilt until the user selects another or closes it.
+       * the LOD — so the selected marker + zone stay put through pan, zoom,
+       * rotate and tilt until the user selects another or closes it.
        */}
       {selectedParking && (
         <SelectedGeometryLayer
