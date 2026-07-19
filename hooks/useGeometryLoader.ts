@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react';
 import { OsmParking } from '../types/parking';
 import { fetchParkingGeometry, GeometryResult } from '../services/overpassService';
+import { normalizeGeometryForParkingTags } from '../utils/parkingGeometry';
 
 export type { GeometryResult };
 
@@ -24,12 +25,28 @@ export const useGeometryLoader = () => {
     setGeometry(null);
     setGeometryLoading(false);
 
-    if (parking.id.startsWith('n')) return;
+    if (parking.id.startsWith('n')) return null;
+
+    if (parking.polygon || parking.polyline) {
+      const embedded = normalizeGeometryForParkingTags(
+        parking.tags,
+        parking.polygon,
+        parking.polyline,
+      );
+      geometryCache.set(parking.id, embedded);
+      setGeometry(embedded);
+      return embedded;
+    }
 
     const cached = geometryCache.get(parking.id);
     if (cached) {
-      setGeometry(cached);
-      return;
+      const normalized = normalizeGeometryForParkingTags(
+        parking.tags,
+        cached.polygon,
+        cached.polyline,
+      );
+      setGeometry(normalized);
+      return normalized;
     }
 
     const ctrl = new AbortController();
@@ -37,14 +54,21 @@ export const useGeometryLoader = () => {
 
     setGeometryLoading(true);
     try {
-      const result = await fetchParkingGeometry(parking.id, ctrl.signal);
+      const fetched = await fetchParkingGeometry(parking.id, ctrl.signal);
+      const result = normalizeGeometryForParkingTags(
+        parking.tags,
+        fetched.polygon,
+        fetched.polyline,
+      );
       geometryCache.set(parking.id, result);
       if (abortCtrl.current === ctrl) setGeometry(result);
+      return result;
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (err instanceof Error && err.name === 'AbortError') return null;
       // Zone outline geometry is an optional enhancement. When the geo mirrors
       // are down / on cooldown this fails expectedly — the marker + sheet still
       // work, so fail quietly instead of spamming warnings.
+      return null;
     } finally {
       if (abortCtrl.current === ctrl) setGeometryLoading(false);
     }
@@ -54,6 +78,7 @@ export const useGeometryLoader = () => {
   // the rendered overlay so the map returns to a clean state
   const clearGeometry = useCallback(() => {
     abortCtrl.current?.abort();
+    abortCtrl.current = null;
     setGeometry(null);
     setGeometryLoading(false);
   }, []);

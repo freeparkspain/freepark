@@ -62,6 +62,30 @@ describe('matchToRoute', () => {
     const m = matchToRoute(index, { latitude: 40, longitude: 0.0005 }, prev, config);
     expect(m.routeProgressMeters).toBeCloseTo(prev.progressMeters, 0);
   });
+
+  it('ignores a stale segment from a longer previous route', () => {
+    const stalePreviousRouteMatch = {
+      progressMeters: 50_000,
+      segmentIndex: 250,
+    };
+
+    expect(() => matchToRoute(
+      index,
+      { latitude: 40, longitude: 0.004 },
+      stalePreviousRouteMatch,
+      config,
+    )).not.toThrow();
+
+    const match = matchToRoute(
+      index,
+      { latitude: 40, longitude: 0.004 },
+      stalePreviousRouteMatch,
+      config,
+    );
+    expect(match.routeSegmentIndex).toBeGreaterThanOrEqual(0);
+    expect(match.routeSegmentIndex).toBeLessThan(coords.length - 1);
+    expect(Number.isFinite(match.bearing)).toBe(true);
+  });
 });
 
 describe('firstSegmentBearing', () => {

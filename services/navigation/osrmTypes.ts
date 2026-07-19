@@ -4,7 +4,7 @@
 //
 // Endpoint shape:
 //   /route/v1/driving/{lon},{lat};{lon},{lat}
-//     ?overview=full&geometries=polyline6&steps=true&alternatives=false
+//     ?overview=full&geometries=polyline6&steps=true&alternatives=3
 
 export interface OsrmManeuver {
   type:      string;
@@ -28,6 +28,10 @@ export interface OsrmStep {
   /** Street name (may be empty string). */
   name?:     string;
   ref?:      string;
+  /** Transport mode for this step — "driving" normally, "ferry" when the
+   *  route crosses water on a car ferry (OSRM's driving profile allows
+   *  routing over `route=ferry` ways tagged as vehicle-accessible). */
+  mode?:     string;
 }
 
 export interface OsrmLeg {

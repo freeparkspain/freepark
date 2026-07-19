@@ -12,7 +12,6 @@ import MapView, {
   Marker,
   Callout,
   MapMarker,
-  Polyline,
   LongPressEvent,
   Region,
 } from "react-native-maps";
@@ -20,12 +19,10 @@ import { useWindowDimensions } from "react-native";
 import * as Location from "expo-location";
 import { useNavigation as useStackNavigation } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import MapViewDirections from "react-native-maps-directions";
 
 import { FilterToggle } from "../components/FilterToggle";
 import { SearchBar } from "../components/SearchBar";
 import { ParkingLayer } from "../components/ParkingLayer";
-import { LoadingOverlay } from "../components/LoadingOverlay";
 import { GeometryLoadingBar } from "../components/GeometryLoadingBar";
 import { RouteBottomSheet, SHEET_HEIGHT } from "../components/RouteBottomSheet";
 import { NearbyParkingSuggestion } from "../components/NearbyParkingSuggestion";
@@ -33,6 +30,7 @@ import { NavigationPanel } from "../components/NavigationPanel";
 import { NavigationArrow } from "../components/NavigationArrow";
 import { NavigationRoute } from "../components/NavigationRoute";
 import { NavigationRecenterButton } from "../components/NavigationRecenterButton";
+import { AppIcon } from "../components/AppIcon";
 import { useMapParkings } from "../hooks/useMapParkings";
 import { useGeometryLoader } from "../hooks/useGeometryLoader";
 import { useNavigation } from "../hooks/useNavigation";
@@ -41,15 +39,31 @@ import { useRouteProgress } from "../hooks/useRouteProgress";
 import { useNavigationCamera } from "../hooks/useNavigationCamera";
 import { useParkingStore } from "../store/useParkingStore";
 import { OsmParking, LatLng, BBox, RouteInfo, SelectedDestination } from "../types/parking";
-import { MAPS_APIKEY, NAVIGATION_PROVIDER } from "../constants/maps";
 import { haversineDistance, deltaToZoom, simplifyCoords } from "../utils/geo";
-import { isPaidParking, parkingName } from "../utils/parking";
-import { ParkingLod, getParkingLod } from "../constants/parkingLod";
+import { isFreeParking, parkingFeeStatus, parkingName } from "../utils/parking";
+import {
+  ParkingAccessCandidate,
+  ParkingAccessSource,
+  classifyParkingGeometry,
+  resolveParkingRouteTarget,
+} from "../utils/parkingAccess";
+import {
+  ParkingAccessContext,
+  fetchParkingAccessContext,
+} from "../services/overpassService";
+import {
+  LOD_MEDIUM_MIN_ZOOM,
+  ParkingLod,
+  getParkingLod,
+  zoomFromDelta,
+} from "../constants/parkingLod";
 import {
   getVisibleTileIds,
   getParkingDataZoom,
   MAX_TILES_PER_VIEWPORT,
 } from "../services/parking/parkingTiles";
+import { fetchOsrmRoute } from "../services/navigation/osrmNavigation";
+import type { NavigationRoute as NavigationRouteModel } from "../types/navigation";
 
 export const MALAGA_REGION = {
   latitude: 36.7213,
@@ -62,6 +76,7 @@ const RECENTER_BOTTOM_DEFAULT    = 40;
 const RECENTER_LIFT_MARGIN       = 12;
 const NEARBY_SUGGESTION_RADIUS_M = 1_500;
 const SUGGESTION_RECOMPUTE_THRESHOLD_M = 80;
+const PARKING_ACCESS_LOOKUP_TIMEOUT_MS = 5_000;
 // Below this zoom, parking markers hide entirely (Google-Maps-like) — even
 // when display is enabled. Matches the fetch threshold (useMapParkings MIN_ZOOM)
 // and the default MALAGA_REGION view (~zoom 12) so a Search Parking press from
@@ -78,11 +93,34 @@ const EMPTY_PARKINGS: OsmParking[] = [];
 // dot (the "disappears after a few Search Parking presses" bug). A constant
 // reference means the native map is never reconfigured by unrelated re-renders.
 const BROWSING_MAP_PADDING = { top: 120, right: 0, bottom: 0, left: 0 };
+// Reduce built-in POI noise while preserving road/place labels needed for
+// orientation. FreePark's own parking layer remains the visual focus.
+const CLEAN_MAP_STYLE: NonNullable<React.ComponentProps<typeof MapView>['customMapStyle']> = [
+  { featureType: 'poi', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+  { featureType: 'poi.business', elementType: 'labels.text', stylers: [{ visibility: 'off' }] },
+  { featureType: 'transit.station', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+];
 // Window (ms) after a marker tap during which a map-press for the SAME physical
 // tap (iOS fires both) is ignored — deterministic, unlike frame timing.
 const MARKER_TAP_GUARD_MS = 350;
 // Stable empty route coords for the car-tracking hook when not navigating.
 const NO_COORDS: LatLng[] = [];
+
+type RoutePreviewState =
+  | { kind: 'idle' }
+  | { kind: 'building'; destinationId: string }
+  | {
+      kind: 'ready';
+      revision: number;
+      destinationId: string;
+      destination: LatLng;
+      origin: LatLng;
+      route: NavigationRouteModel;
+      routeInfo: RouteInfo;
+    }
+  | { kind: 'error'; destinationId: string; message: string };
+
+const IDLE_ROUTE_PREVIEW: RoutePreviewState = { kind: 'idle' };
 
 // Approximate heights of the navigation overlays (from their own styles), used
 // to compute usable map area for camera padding — NOT device-specific offsets.
@@ -109,14 +147,41 @@ function bboxContains(outer: BBox, inner: BBox): boolean {
 /** Max number of accumulated search zones kept (bounds memory / perf guard). */
 const MAX_SEARCH_ZONES = 24;
 
+function parkingAccessLabel(source: ParkingAccessSource): string {
+  switch (source) {
+    case 'polygon-center':
+      return 'Route to parking zone center';
+    case 'explicit-entrance':
+      return 'Route to mapped vehicle entrance';
+    case 'service-intersection':
+      return 'Route to parking driveway';
+    case 'service-nearest':
+      return 'Route to nearest driveway access';
+    case 'street-endpoint':
+      return 'Route to start of parking segment';
+    case 'boundary-fallback':
+      return 'Route to nearest parking boundary';
+    default:
+      return 'Route to mapped parking point';
+  }
+}
+
 export const MapScreen: React.FC = () => {
   // ── OSM parking zone hooks ───────────────────────────────────────────────────
-  const { parkings, loading, loadForRegion, loadZoneGeometry } = useMapParkings();
+  const {
+    parkings,
+    loading,
+    zoneGeometryLoading,
+    fetchError,
+    loadForRegion,
+    loadZoneGeometry,
+  } = useMapParkings();
   const { geometry, geometryLoading, loadGeometry, clearGeometry } = useGeometryLoader();
 
   // ── Turn-by-turn navigation (OSRM + expo-location + expo-speech) ─────────────
   const nav = useNavigation();
   const navActive = nav.isActive;
+  const carTrackingActive = nav.state.kind === 'navigating';
   // Live mirror of `nav` so the stable marker-tap handler can read it without
   // taking `nav` as a dependency (which would recreate the handler each render).
   const navRef = useRef(nav);
@@ -162,6 +227,15 @@ export const MapScreen: React.FC = () => {
   // demand (parking is never auto-loaded on pan/zoom anymore).
   const lastRegionRef       = useRef<Region>(MALAGA_REGION);
   const osrmFetchIdRef      = useRef(0);
+  const routePreviewAbortRef = useRef<AbortController | null>(null);
+  const parkingAccessRequestRef = useRef(0);
+  const parkingAccessAbortRef = useRef<AbortController | null>(null);
+  const navigationStartPendingRef = useRef(false);
+  const parkingAccessContextRef = useRef<{
+    parkingId: string;
+    context: ParkingAccessContext;
+  } | null>(null);
+  const userLocationRef = useRef<LatLng | null>(null);
 
   // ── Search / long-press pin state ────────────────────────────────────────────
   const [searchPin, setSearchPin] = useState<{
@@ -200,13 +274,14 @@ export const MapScreen: React.FC = () => {
   // already-selected parking (toggle-off) without depending on selection state.
   const selectedParkingIdRef = useRef<string | null>(null);
   selectedParkingIdRef.current = selectedParkingId;
-  const [activeRoute,         setActiveRoute]         = useState(false);
-  const [routeInfo,           setRouteInfo]           = useState<RouteInfo | null>(null);
-  const [routeError,          setRouteError]          = useState<string | null>(null);
-  const [osrmPolyline,        setOsrmPolyline]        = useState<LatLng[] | null>(null);
+  const [routePreview, setRoutePreview] = useState<RoutePreviewState>(IDLE_ROUTE_PREVIEW);
   const [selectedDestination, setSelectedDestination] = useState<SelectedDestination | null>(null);
   const [userLocation,        setUserLocation]        = useState<LatLng | null>(null);
   const [locationDenied,      setLocationDenied]      = useState(false);
+  const [selectedParkingAccess, setSelectedParkingAccess] =
+    useState<ParkingAccessCandidate | null>(null);
+  const [parkingAccessLoading, setParkingAccessLoading] = useState(false);
+  userLocationRef.current = nav.location?.position ?? userLocation;
 
   // Parking is rendered only after "Search Parking" is tapped, and ONLY inside
   // the zones that were searched. `searchZones` ACCUMULATES each searched
@@ -230,12 +305,23 @@ export const MapScreen: React.FC = () => {
   // camera is zoomed too far out to search) — BUG 8.
   const [searchHint, setSearchHint] = useState<string | null>(null);
 
+  // A failed/rate-limited region fetch previously only logged a console.warn —
+  // "Search this area" went quiet with no new markers and no feedback,
+  // indistinguishable from "we searched and there's genuinely nothing here".
+  // Surface it through the same hint pill so a real failure is visible.
+  useEffect(() => {
+    if (fetchError) setSearchHint(fetchError);
+  }, [fetchError]);
+
   // ── Car tracking + navigation camera ─────────────────────────────────────────
   const insets = useSafeAreaInsets();
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const routeCoords = nav.route?.points ?? NO_COORDS;
+  const navigationEndpoint = nav.route && nav.route.points.length > 0
+    ? nav.route.points[nav.route.points.length - 1]
+    : nav.destination;
 
-  const car = useCarTracking(nav.location, routeCoords, navActive);
+  const car = useCarTracking(nav.location, routeCoords, carTrackingActive);
   const routeSplit = useRouteProgress(routeCoords, car.matchedLocation);
 
   // Simplify the full OSRM route for RENDERING only (matching still uses the
@@ -247,9 +333,13 @@ export const MapScreen: React.FC = () => {
     () => (nav.route ? simplifyCoords(nav.route.points, 5) : NO_COORDS),
     [nav.route],
   );
-  const routeKey = nav.route
-    ? `${nav.route.points.length}:${Math.round(nav.route.totalDistanceMeters)}`
-    : 'none';
+  const previewRenderRoute = React.useMemo(
+    () => routePreview.kind === 'ready'
+      ? simplifyCoords(routePreview.route.points, 5)
+      : NO_COORDS,
+    [routePreview],
+  );
+  const routeKey = `nav-route-${nav.routeRevision}`;
 
   const mapLayout = React.useMemo(
     () => ({
@@ -271,9 +361,22 @@ export const MapScreen: React.FC = () => {
     matchedSegmentBearing: car.matchedLocation?.bearing ?? null,
     routeCoordinates:      routeCoords,
     navigationActive:      navActive,
+    navigationSessionRevision: nav.sessionRevision,
     gpsBearing:            nav.location?.bearingDegrees ?? null,
     speedMps:              nav.location?.speedMps ?? null,
+    distanceToNextManeuverMeters:
+      nav.state.kind === 'navigating' ? nav.state.distanceToNextManeuverMeters : null,
   });
+
+  const handleNavigationPanDrag = useCallback(() => {
+    camera.enterFreeMode();
+    navRef.current.setFollowing(false);
+  }, [camera.enterFreeMode]);
+
+  const handleNavigationRecenter = useCallback(() => {
+    camera.recenter();
+    navRef.current.recenter();
+  }, [camera.recenter]);
 
   // ── Free/paid filter ─────────────────────────────────────────────────────────
   // Drives which OSM markers/clusters render. "Free Only" hides paid spots from
@@ -293,7 +396,7 @@ export const MapScreen: React.FC = () => {
           p.position.longitude >= b.west  && p.position.longitude <= b.east,
       ),
     );
-    return filterOnlyFree ? inArea.filter((p) => !isPaidParking(p.tags)) : inArea;
+    return filterOnlyFree ? inArea.filter((p) => isFreeParking(p.tags)) : inArea;
   }, [searchZones, parkings, filterOnlyFree]);
 
   // ── Parking rendered on the map ───────────────────────────────────────────────
@@ -302,10 +405,18 @@ export const MapScreen: React.FC = () => {
   // clean and stops the follow-camera from re-clustering thousands of points on
   // every GPS tick (the old flicker/slippage/jank). Only route + arrow +
   // destination pin render while driving.
-  const parkingForMap  = navActive ? EMPTY_PARKINGS : visibleParkings;
-  const selectedForMap = navActive ? null : selectedParking;
+  //
+  // The same declutter applies once a route PREVIEW is being built/shown: with
+  // parking markers/zone outlines left on, the selected zone's own blue outline
+  // (and any nearby paid zone's orange outline) visually tangles with the route
+  // polyline — that was the "looks very bad" clutter. Good map apps hide POIs
+  // the moment a route is requested and show only origin + destination + line.
+  const previewingRoute =
+    !navActive && (routePreview.kind === 'building' || routePreview.kind === 'ready');
+  const parkingForMap  = navActive || previewingRoute ? EMPTY_PARKINGS : visibleParkings;
+  const selectedForMap = navActive || previewingRoute ? null : selectedParking;
 
-  const canNavigate = NAVIGATION_PROVIDER === 'osrm' || MAPS_APIKEY.length > 0;
+  const canNavigate = true;
 
   const recenterLift = Math.max(
     keyboardHeight      > 0 ? keyboardHeight   + RECENTER_LIFT_MARGIN : 0,
@@ -318,24 +429,34 @@ export const MapScreen: React.FC = () => {
 
   // ── Effects ───────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (droppedPin && !droppedPin.loading) {
+    if (!navActive && droppedPin && !droppedPin.loading) {
       const t = setTimeout(() => droppedMarkerRef.current?.showCallout(), 400);
       return () => clearTimeout(t);
     }
-  }, [droppedPin?.id, droppedPin?.loading]);
+  }, [navActive, droppedPin?.id, droppedPin?.loading]);
 
   useEffect(() => {
-    if (searchPin) {
+    if (!navActive && searchPin) {
       const t = setTimeout(() => searchMarkerRef.current?.showCallout(), 500);
       return () => clearTimeout(t);
     }
-  }, [searchPin]);
+  }, [navActive, searchPin]);
+
+  useEffect(() => () => {
+    osrmFetchIdRef.current++;
+    routePreviewAbortRef.current?.abort();
+    parkingAccessRequestRef.current++;
+    parkingAccessAbortRef.current?.abort();
+  }, []);
 
   // Location permission + live tracking for routing. Grabs a fast one-shot fix
   // via getCurrentPositionAsync FIRST (watchPositionAsync can take many seconds
   // to emit its first sample — that lag was the "Waiting for location…" the
   // bottom sheet got stuck on), then subscribes for live updates.
   useEffect(() => {
+    // Turn-by-turn owns a BestForNavigation watcher. Do not keep a second native
+    // subscription alive in parallel; browsing tracking resumes after End.
+    if (navActive) return;
     let sub: Location.LocationSubscription | null = null;
     let cancelled = false;
     (async () => {
@@ -353,14 +474,23 @@ export const MapScreen: React.FC = () => {
       } catch {
         /* one-shot fix failed — the watcher below still provides a position */
       }
-      sub = await Location.watchPositionAsync(
+      const nextSub = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.Balanced, distanceInterval: 10 },
-        (loc) =>
-          setUserLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude }),
+        (loc) => {
+          if (cancelled) return;
+          setUserLocation({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
+        },
       );
-    })();
+      if (cancelled) {
+        nextSub.remove();
+      } else {
+        sub = nextSub;
+      }
+    })().catch(() => {
+      // Permission/location APIs can reject during backgrounding or teardown.
+    });
     return () => { cancelled = true; sub?.remove(); };
-  }, []);
+  }, [navActive]);
 
   // On-demand location acquisition — used by "Start Route" and the sheet's
   // "Enable location" retry. Requests permission if needed and resolves a fresh
@@ -384,21 +514,40 @@ export const MapScreen: React.FC = () => {
     }
   }, [userLocation]);
 
+  const handleBrowseRecenter = useCallback(async () => {
+    const location = userLocation ?? await ensureUserLocation();
+    mapRef.current?.animateToRegion(
+      location
+        ? { ...location, latitudeDelta: 0.01, longitudeDelta: 0.01 }
+        : MALAGA_REGION,
+      650,
+    );
+  }, [ensureUserLocation, userLocation]);
+
+  const clearRoutePreview = useCallback(() => {
+    osrmFetchIdRef.current++;
+    routePreviewAbortRef.current?.abort();
+    routePreviewAbortRef.current = null;
+    setRoutePreview(IDLE_ROUTE_PREVIEW);
+  }, []);
+
   // Single source of truth for clearing the current parking/destination
   // selection and any route state built for it. One stable helper used by the
   // map-press, the close control, the re-tap toggle, the filter and the
   // "selection no longer exists" guard — so the selected marker, selected zone,
   // selected paid parking and the info sheet can never drift out of sync.
   const clearSelection = useCallback(() => {
-    osrmFetchIdRef.current++;
+    clearRoutePreview();
+    parkingAccessRequestRef.current++;
+    parkingAccessAbortRef.current?.abort();
+    parkingAccessAbortRef.current = null;
+    parkingAccessContextRef.current = null;
     setSelectedParking(null);
     setSelectedDestination(null);
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
+    setSelectedParkingAccess(null);
+    setParkingAccessLoading(false);
     clearGeometry();
-  }, [clearGeometry]);
+  }, [clearGeometry, clearRoutePreview]);
 
   // Driving aid: throttled "nearest parking" scan.
   // Scans visibleParkings (the filtered set) so a driver on "Free Only" is
@@ -440,8 +589,10 @@ export const MapScreen: React.FC = () => {
   // are hidden (no display = no geometry pulls). Iterates the filtered
   // `visibleParkings` so paid zones aren't fetched while on Free Only.
   useEffect(() => {
-    // No parking is drawn during navigation, and low LOD draws no outlines.
-    if (navActive || !parkingVisible || lod === 'low') return;
+    // Prefetch shortly before the visual switch so users never zoom into an
+    // empty map. The existing LOD hysteresis keeps the actual mode stable.
+    const shouldPrefetch = zoomFromDelta(latDelta) >= LOD_MEDIUM_MIN_ZOOM - 0.6;
+    if (navActive || !parkingVisible || !shouldPrefetch) return;
     const visibleIds = visibleParkings
       .filter(p =>
         !p.polygon && !p.polyline &&
@@ -450,15 +601,15 @@ export const MapScreen: React.FC = () => {
       )
       .map(p => p.id);
     if (visibleIds.length) loadZoneGeometry(visibleIds);
-  }, [navActive, parkingVisible, lod, visibleParkings, viewportBounds, loadZoneGeometry]);
+  }, [navActive, parkingVisible, latDelta, visibleParkings, viewportBounds, loadZoneGeometry]);
 
-  // Free Only just hid the selected paid parking — clear the whole selection so
+  // Free Only just hid a paid/unknown parking — clear the whole selection so
   // nothing points at a spot the filter no longer renders (the stale selected-id
   // + geometry was the filter-toggle crash). Source data/cache is untouched;
   // toggling back to All Parking simply lets it be re-selected.
   useEffect(() => {
     if (!filterOnlyFree || !selectedParking) return;
-    if (!isPaidParking(selectedParking.tags)) return; // snapshot carries the tags
+    if (isFreeParking(selectedParking.tags)) return; // snapshot carries the tags
     clearSelection();
   }, [filterOnlyFree, selectedParking, clearSelection]);
 
@@ -487,7 +638,10 @@ export const MapScreen: React.FC = () => {
   }, []);
 
   // ── Map event handlers ────────────────────────────────────────────────────────
-  const handleRegionChangeComplete = useCallback((region: Region) => {
+  const handleRegionChangeComplete = useCallback((
+    region: Region,
+    details?: { isGesture?: boolean },
+  ) => {
     // 100 ms post-settle buffer: on iOS, onRegionChangeComplete fires while
     // the native animation is still winding down. Clearing isGesturingRef
     // immediately lets a marker tap race the bridge's cleanup and crash the app.
@@ -511,8 +665,11 @@ export const MapScreen: React.FC = () => {
     // moves. A fresh "Search Parking" press re-scopes to the new viewport.
     //
     // Let the nav camera decide if this was a genuine user gesture (→ free mode).
-    camera.handleRegionChangeComplete();
-  }, [camera.handleRegionChangeComplete]);
+    camera.handleRegionChangeComplete(details?.isGesture);
+    if (details?.isGesture === true && navActive) {
+      navRef.current.setFollowing(false);
+    }
+  }, [camera.handleRegionChangeComplete, navActive]);
 
   // Manual parking fetch + display for the current viewport — the ONLY path
   // that pulls new Overpass data and the ONLY thing that reveals markers.
@@ -567,9 +724,8 @@ export const MapScreen: React.FC = () => {
 
   // Long-press: drops a pin, sets it as navigation destination, reverse-geocodes address.
   const handleLongPress = useCallback(async (e: LongPressEvent) => {
+    clearSelection();
     setSearchPin(null);
-    setSelectedParking(null);
-    clearGeometry();
 
     const { latitude, longitude } = e.nativeEvent.coordinate;
     const newId      = Date.now();
@@ -581,10 +737,6 @@ export const MapScreen: React.FC = () => {
 
     setDroppedPin({ id: newId, latitude, longitude, loading: true, address: 'Searching…' });
     setSelectedDestination({ id: pinId, type: 'pin', title: coordTitle, position });
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
 
     try {
       const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
@@ -603,7 +755,7 @@ export const MapScreen: React.FC = () => {
         prev?.id === newId ? { ...prev, address: coordTitle, loading: false } : prev,
       );
     }
-  }, [clearGeometry]);
+  }, [clearSelection]);
 
   // Search result selected: places a pin, sets navigation destination, animates camera.
   const handleLocationSelect = useCallback(
@@ -611,28 +763,92 @@ export const MapScreen: React.FC = () => {
       const title = addr || 'Selected Point';
       console.log('[MapScreen] search result selected:', title);
 
+      clearSelection();
       setDroppedPin(null);
       setSearchPin({ latitude: lat, longitude: lon, address: title });
-      setSelectedParking(null);
       setSelectedDestination({
         id:       `search-${lat}-${lon}`,
         type:     'search',
         title,
         position: { latitude: lat, longitude: lon },
       });
-      setActiveRoute(false);
-      setRouteInfo(null);
-      setRouteError(null);
-      setOsrmPolyline(null);
-      clearGeometry();
       mapRef.current?.animateToRegion(
         { latitude: lat, longitude: lon, latitudeDelta: 0.003, longitudeDelta: 0.003 },
         800,
       );
       console.log('[MapScreen] navigation sheet opening for search result');
     },
-    [clearGeometry],
+    [clearSelection],
   );
+
+  // Resolve the route target without blocking selection. Full geometry refines
+  // a polygon selection to its exact centre; point objects may still use nearby
+  // mapped entrances and driveways.
+  const refineParkingAccess = useCallback(async (parking: OsmParking) => {
+    const requestId = ++parkingAccessRequestRef.current;
+    parkingAccessAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    parkingAccessAbortRef.current = ctrl;
+    parkingAccessContextRef.current = null;
+    setParkingAccessLoading(true);
+
+    const applyCandidate = (candidate: ParkingAccessCandidate | null) => {
+      if (!candidate || requestId !== parkingAccessRequestRef.current || ctrl.signal.aborted) return;
+      setSelectedParkingAccess(candidate);
+      setSelectedDestination((current) =>
+        current?.type === 'parking' && current.id === parking.id
+          ? { ...current, position: candidate.position }
+          : current,
+      );
+    };
+
+    try {
+      const loadedGeometry = await loadGeometry(parking);
+      if (requestId !== parkingAccessRequestRef.current || ctrl.signal.aborted) return;
+
+      const detailedParking: OsmParking = {
+        ...parking,
+        polygon: loadedGeometry?.polygon ?? parking.polygon,
+        polyline: loadedGeometry?.polyline ?? parking.polyline,
+      };
+      const reference = userLocationRef.current ?? parking.position;
+      applyCandidate(resolveParkingRouteTarget({ ...detailedParking, reference }));
+
+      const geometryKind = classifyParkingGeometry(detailedParking);
+      if (geometryKind === 'street' || geometryKind === 'area') return;
+
+      const accessCtrl = new AbortController();
+      const abortAccessLookup = () => accessCtrl.abort();
+      const accessTimer = setTimeout(
+        () => accessCtrl.abort(),
+        PARKING_ACCESS_LOOKUP_TIMEOUT_MS,
+      );
+      ctrl.signal.addEventListener('abort', abortAccessLookup, { once: true });
+      try {
+        const context = await fetchParkingAccessContext(detailedParking, accessCtrl.signal);
+        if (requestId === parkingAccessRequestRef.current && !ctrl.signal.aborted) {
+          parkingAccessContextRef.current = { parkingId: parking.id, context };
+        }
+        applyCandidate(resolveParkingRouteTarget({
+          ...detailedParking,
+          explicitEntrances: context.entrances,
+          serviceWays: context.serviceWays,
+          reference: userLocationRef.current ?? reference,
+        }));
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') return;
+        // The local boundary/endpoint remains a usable fallback.
+      } finally {
+        clearTimeout(accessTimer);
+        ctrl.signal.removeEventListener('abort', abortAccessLookup);
+      }
+    } finally {
+      if (requestId === parkingAccessRequestRef.current) {
+        parkingAccessAbortRef.current = null;
+        setParkingAccessLoading(false);
+      }
+    }
+  }, [loadGeometry]);
 
   // OSM parking marker (free "P" or paid "€") tapped: selects it and opens the
   // info sheet, re-tapping the selected one toggles it off. Stable identity — it
@@ -650,11 +866,18 @@ export const MapScreen: React.FC = () => {
     requestAnimationFrame(() => { markerJustTappedRef.current = false; });
 
     const navigation = navRef.current;
+    const immediateAccess = resolveParkingRouteTarget({
+      ...parking,
+      reference: userLocationRef.current ?? parking.position,
+    });
     // Already navigating? Tapping a parking immediately re-routes to it — no
     // need to leave navigation to pick the next destination.
     if (navigation.isActive) {
       console.log('[MapScreen] reroute to tapped parking during navigation:', parking.id);
-      navigation.start(parking.position);
+      clearSelection();
+      setSearchPin(null);
+      setDroppedPin(null);
+      navigation.start(immediateAccess?.position ?? parking.position);
       return;
     }
 
@@ -671,26 +894,27 @@ export const MapScreen: React.FC = () => {
       id:       parking.id,
       type:     'parking',
       title:    parkingName(parking),
-      position: parking.position,
+      position: immediateAccess?.position ?? parking.position,
     };
     setSelectedParking(parking);
+    setSelectedParkingAccess(immediateAccess);
     setSelectedDestination(dest);
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
-    loadGeometry(parking);
+    clearRoutePreview();
+    void refineParkingAccess(parking);
 
     console.log('[MapScreen] info sheet opening for parking:', dest.title);
-  }, [loadGeometry, clearSelection]);
+  }, [refineParkingAccess, clearSelection, clearRoutePreview]);
 
   // Long-press WHILE navigating → drop a new destination and reroute instantly,
   // so the driver can chain to a next stop without leaving navigation.
   const handleNavLongPress = useCallback((e: LongPressEvent) => {
     const { latitude, longitude } = e.nativeEvent.coordinate;
     console.log('[MapScreen] reroute to long-press point during navigation:', latitude, longitude);
+    clearSelection();
+    setSearchPin(null);
+    setDroppedPin(null);
     nav.start({ latitude, longitude });
-  }, [nav]);
+  }, [clearSelection, nav]);
 
   // Suggestion card tapped: animates the camera to the spot then selects it.
   const handlePressNearbySuggestion = useCallback(() => {
@@ -722,28 +946,85 @@ export const MapScreen: React.FC = () => {
   }, []); // stable — reads viewport from ref at call time
 
   // ── Bottom sheet handlers ─────────────────────────────────────────────────────
-  // "Start Route" launches full in-app turn-by-turn navigation (OSRM route +
-  // voice + reroute) via the navigation hook — it owns location acquisition,
-  // route building and the live guidance state machine. The old static route
-  // preview is superseded by this richer flow.
+  // Stage one builds and fits the complete route without starting guidance.
+  // Stage two reuses that exact route for turn-by-turn navigation.
+  const handlePreviewRoute = useCallback(async () => {
+    if (!selectedDestination || parkingAccessLoading) return;
+    const destination = { ...selectedDestination.position };
+    const destinationId = selectedDestination.id;
+    const requestId = ++osrmFetchIdRef.current;
+    routePreviewAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    routePreviewAbortRef.current = ctrl;
+    setRoutePreview({ kind: 'building', destinationId });
+
+    const origin = userLocation ?? await ensureUserLocation();
+    if (requestId !== osrmFetchIdRef.current || ctrl.signal.aborted) return;
+    if (!origin) {
+      routePreviewAbortRef.current = null;
+      setRoutePreview({
+        kind: 'error',
+        destinationId,
+        message: 'Could not determine your location',
+      });
+      return;
+    }
+
+    try {
+      const result = await fetchOsrmRoute(origin, destination, ctrl.signal);
+      if (requestId !== osrmFetchIdRef.current || ctrl.signal.aborted) return;
+      setRoutePreview({
+        kind: 'ready',
+        revision: requestId,
+        destinationId,
+        destination,
+        origin,
+        route: result.navigationRoute,
+        routeInfo: result.routeInfo,
+      });
+      mapRef.current?.fitToCoordinates(result.polyline, {
+        edgePadding: {
+          top: insets.top + 150,
+          bottom: insets.bottom + SHEET_HEIGHT + 32,
+          left: 36,
+          right: 36,
+        },
+        animated: true,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') return;
+      if (requestId !== osrmFetchIdRef.current || ctrl.signal.aborted) return;
+      setRoutePreview({
+        kind: 'error',
+        destinationId,
+        message: error instanceof Error ? error.message : 'Route unavailable',
+      });
+    } finally {
+      if (routePreviewAbortRef.current === ctrl) routePreviewAbortRef.current = null;
+    }
+  }, [
+    selectedDestination,
+    parkingAccessLoading,
+    userLocation,
+    ensureUserLocation,
+    insets.top,
+    insets.bottom,
+  ]);
+
   const handleStartRoute = useCallback(() => {
-    if (!selectedDestination) return;
-    console.log('[MapScreen] Start Route pressed for:', selectedDestination.title);
-    nav.start(selectedDestination.position);
-  }, [selectedDestination, nav]);
+    if (routePreview.kind !== 'ready' || navigationStartPendingRef.current) return;
+    navigationStartPendingRef.current = true;
+    const { destination, route } = routePreview;
+    clearRoutePreview();
+    void nav.startPrepared(destination, route).finally(() => {
+      navigationStartPendingRef.current = false;
+    });
+  }, [routePreview, clearRoutePreview, nav]);
 
   // Re-attempt navigation to the same destination after a recoverable error.
   const handleRetryNavigation = useCallback(() => {
     if (nav.destination) nav.start(nav.destination);
   }, [nav]);
-
-  const handleCancelRoute = useCallback(() => {
-    osrmFetchIdRef.current++;
-    setActiveRoute(false);
-    setRouteInfo(null);
-    setRouteError(null);
-    setOsrmPolyline(null);
-  }, []);
 
   const handleCloseSheet = useCallback(() => {
     clearSelection();
@@ -761,12 +1042,13 @@ export const MapScreen: React.FC = () => {
         // EXPO_PUBLIC_GOOGLE_MAPS_API_KEY. Requires a dev/prebuild — in Expo Go
         // on iOS the provider silently falls back to Apple Maps.
         provider={PROVIDER_GOOGLE}
+        customMapStyle={CLEAN_MAP_STYLE}
         initialRegion={MALAGA_REGION}
-        showsUserLocation={!navActive}
+        showsUserLocation={!carTrackingActive || !car.carPosition}
         showsMyLocationButton={false}
         onLongPress={navActive ? handleNavLongPress : handleLongPress}
         onPress={navActive ? undefined : handleMapPress}
-        onPanDrag={navActive ? camera.enterFreeMode : undefined}
+        onPanDrag={navActive ? handleNavigationPanDrag : undefined}
         onRegionChange={handleRegionChange}
         onRegionChangeComplete={handleRegionChangeComplete}
         // Stable reference while browsing (BROWSING_MAP_PADDING) — a fresh object
@@ -801,12 +1083,12 @@ export const MapScreen: React.FC = () => {
         )}
         {/* Red destination pin — marks where the driver is heading (parking is
             hidden during navigation, so this is the only destination marker). */}
-        {navActive && nav.destination && (
+        {navActive && navigationEndpoint && (
           <Marker
             // Key by coordinate so a reroute remounts the pin at the new point
             // (and it re-rasterises), fixing the "tapped point disappears" case.
-            key={`nav-dest-${nav.destination.latitude.toFixed(5)},${nav.destination.longitude.toFixed(5)}`}
-            coordinate={nav.destination}
+            key={`nav-dest-${navigationEndpoint.latitude.toFixed(5)},${navigationEndpoint.longitude.toFixed(5)}`}
+            coordinate={navigationEndpoint}
             anchor={{ x: 0.5, y: 1 }}
           >
             <CustomPinView color="#EF4444" />
@@ -814,51 +1096,42 @@ export const MapScreen: React.FC = () => {
         )}
         {/* Single premium navigation arrow — smooth movement (AnimatedRegion) +
             rotation. Rendered once the first fix arrives; updated in place. */}
-        {navActive && car.carPosition && (
-          <NavigationArrow coordinate={car.animatedCoordinate} rotation={car.rotation} />
-        )}
-
-        {/* In-app Google route — rendered by MapViewDirections as a polyline */}
-        {activeRoute && NAVIGATION_PROVIDER === 'google' && MAPS_APIKEY.length > 0 && userLocation && selectedDestination && (
-          <MapViewDirections
-            origin={userLocation}
-            destination={selectedDestination.position}
-            apikey={MAPS_APIKEY}
-            strokeWidth={5}
-            strokeColor="#007AFF"
-            onReady={(result: { distance: number; duration: number }) => {
-              console.log('[MapScreen] Google route ready:', result.distance.toFixed(1), 'km');
-              setRouteInfo({ distance: result.distance, duration: result.duration });
-              setRouteError(null);
-            }}
-            onError={(err: string) => {
-              console.warn('[MapScreen] Google route failed:', err);
-              setRouteError(err || 'Route unavailable');
-            }}
+        {carTrackingActive && car.carPosition && (
+          <NavigationArrow
+            key={`nav-car-${nav.routeRevision}`}
+            coordinate={car.animatedCoordinate}
+            rotation={car.rotation}
           />
         )}
 
-        {/* OSRM route polyline (only when NAVIGATION_PROVIDER=osrm) */}
-        {activeRoute && NAVIGATION_PROVIDER === 'osrm' && osrmPolyline && (
-          <Polyline
-            coordinates={osrmPolyline}
-            strokeWidth={5}
-            strokeColor="#007AFF"
+        {/* Full preview stays in browsing mode until the user explicitly starts. */}
+        {!navActive && routePreview.kind === 'ready' && (
+          <NavigationRoute
+            key={`preview-route-${routePreview.destinationId}-${routePreview.revision}`}
+            route={previewRenderRoute}
+            completed={NO_COORDS}
           />
         )}
 
-        {/* Fallback straight dashed line when the route provider fails */}
-        {activeRoute && routeError && userLocation && selectedDestination && (
-          <Polyline
-            coordinates={[userLocation, selectedDestination.position]}
-            strokeWidth={3}
-            strokeColor="#9CA3AF"
-            lineDashPattern={[8, 4]}
-          />
+        {/* Destination pin for a previewed PARKING route. Parking markers/zones
+            are hidden while previewingRoute (see parkingForMap/selectedForMap
+            above), so this is the only marker for that destination — matching
+            the clean origin-dot + destination-pin look of mainstream map apps.
+            Search/dropped-pin destinations already render their own pin below,
+            so this only covers the 'parking' case to avoid a duplicate. */}
+        {previewingRoute && selectedDestination?.type === 'parking' && (
+          <Marker
+            key={`preview-dest-${selectedDestination.id}`}
+            coordinate={selectedDestination.position}
+            anchor={{ x: 0.5, y: 1 }}
+            zIndex={15}
+          >
+            <CustomPinView color="#EF4444" />
+          </Marker>
         )}
 
         {/* Search result pin */}
-        {searchPin && (
+        {!navActive && searchPin && (
           <Marker
             key={`search-${searchPin.latitude}`}
             ref={searchMarkerRef}
@@ -878,7 +1151,7 @@ export const MapScreen: React.FC = () => {
         )}
 
         {/* Long-press dropped pin with reverse-geocoded address */}
-        {droppedPin && (
+        {!navActive && droppedPin && (
           <Marker
             key={`drop-${droppedPin.id}`}
             ref={droppedMarkerRef}
@@ -903,19 +1176,19 @@ export const MapScreen: React.FC = () => {
       </MapView>
 
       {/* Thin animated bar at screen top — visible during any fetch */}
-      <GeometryLoadingBar visible={geometryLoading || loading} />
-      {/* Spinner below the header — only during main markers fetch */}
-      <LoadingOverlay visible={loading} top={140} />
-
+      <GeometryLoadingBar visible={geometryLoading || zoneGeometryLoading || loading} />
       {/* Map-browsing UI — hidden entirely while turn-by-turn navigation runs
           (the NavigationPanel owns the screen then). */}
-      {!navActive && (
+      {/* Search chrome — hidden while a route is being previewed/built so the
+          map stays focused on origin → destination, the same way mainstream
+          map apps collapse search UI once directions are requested. The
+          RouteBottomSheet's close (X) brings it back. */}
+      {!navActive && !previewingRoute && (
         <>
           {/* Header: search bar + free/all filter toggle */}
           <View style={styles.headerWrapper}>
             <View style={styles.searchBox}>
               <SearchBar
-                mapRef={mapRef as any}
                 onLocationSelect={handleLocationSelect}
                 onClear={() => setSearchPin(null)}
               />
@@ -934,9 +1207,12 @@ export const MapScreen: React.FC = () => {
               onPress={handleSearchParking}
               activeOpacity={0.85}
               disabled={loading}
+              accessibilityRole="button"
+              accessibilityLabel="Search this area"
             >
+              <SearchAreaIcon color={loading ? '#7EB1FA' : '#0878F9'} />
               <Text style={styles.searchParkingText}>
-                {loading ? 'Searching…' : '🅿  Search Parking'}
+                {loading ? 'Searching…' : 'Search this area'}
               </Text>
             </TouchableOpacity>
             {searchHint && (
@@ -945,7 +1221,11 @@ export const MapScreen: React.FC = () => {
               </View>
             )}
           </View>
+        </>
+      )}
 
+      {!navActive && (
+        <>
           {/* Driving aid — closest known parking area to the driver's live position */}
           {showNearbySuggestion && nearestParking && (
             <View style={styles.nearbySuggestionWrapper} pointerEvents="box-none">
@@ -961,28 +1241,38 @@ export const MapScreen: React.FC = () => {
           <View style={[styles.recenterContainer, { bottom: recenterBottom }]}>
             <TouchableOpacity
               style={styles.recenterButton}
-              onPress={() => mapRef.current?.animateToRegion(MALAGA_REGION, 800)}
+              onPress={handleBrowseRecenter}
+              accessibilityRole="button"
+              accessibilityLabel="Recenter map"
             >
-              <Text style={{ fontSize: 25 }}>📍</Text>
+              <AppIcon name="locate-outline" size={25} color="#0878F9" />
             </TouchableOpacity>
           </View>
 
           {/* Universal destination + routing bottom sheet */}
           <RouteBottomSheet
             destination={selectedDestination}
-            parkingPaid={
+            parkingFeeStatus={
               selectedDestination?.type === 'parking' && selectedParking
-                ? isPaidParking(selectedParking.tags)
+                ? parkingFeeStatus(selectedParking.tags)
                 : null
             }
-            activeRoute={activeRoute}
-            routeInfo={routeInfo}
+            parkingAccessLabel={
+              selectedDestination?.type === 'parking' && selectedParkingAccess
+                ? parkingAccessLabel(selectedParkingAccess.source)
+                : null
+            }
+            parkingAccessLoading={
+              selectedDestination?.type === 'parking' && parkingAccessLoading
+            }
+            previewStatus={routePreview.kind}
+            routeInfo={routePreview.kind === 'ready' ? routePreview.routeInfo : null}
             userLocation={userLocation}
             canNavigate={canNavigate}
-            routeError={routeError}
+            routeError={routePreview.kind === 'error' ? routePreview.message : null}
             locationDenied={locationDenied}
+            onPreviewRoute={handlePreviewRoute}
             onStartRoute={handleStartRoute}
-            onCancelRoute={handleCancelRoute}
             onRequestLocation={ensureUserLocation}
             onClose={handleCloseSheet}
           />
@@ -993,7 +1283,7 @@ export const MapScreen: React.FC = () => {
           below centre, road ahead up. Sits above the bottom trip bar + safe area. */}
       {navActive && camera.cameraMode === 'free' && (
         <NavigationRecenterButton
-          onPress={camera.recenter}
+          onPress={handleNavigationRecenter}
           bottom={insets.bottom + NAV_BOTTOM_BAR_HEIGHT + 24}
         />
       )}
@@ -1003,7 +1293,7 @@ export const MapScreen: React.FC = () => {
         state={nav.state}
         onStop={nav.stop}
         onToggleMute={nav.toggleMute}
-        onRecenter={camera.recenter}
+        onRecenter={handleNavigationRecenter}
         onRetry={handleRetryNavigation}
       />
     </View>
@@ -1016,6 +1306,17 @@ const CustomPinView = ({ color }: { color: string }) => (
       <View style={pinStyles.dot} />
     </View>
     <View style={[pinStyles.needle, { backgroundColor: color }]} />
+  </View>
+);
+
+const SearchAreaIcon = ({ color }: { color: string }) => (
+  <View style={searchAreaIconStyles.container}>
+    <View style={[searchAreaIconStyles.ring, { borderColor: color }]} />
+    <View style={[searchAreaIconStyles.dot, { backgroundColor: color }]} />
+    <View style={[searchAreaIconStyles.tickVertical, searchAreaIconStyles.tickTop, { backgroundColor: color }]} />
+    <View style={[searchAreaIconStyles.tickVertical, searchAreaIconStyles.tickBottom, { backgroundColor: color }]} />
+    <View style={[searchAreaIconStyles.tickHorizontal, searchAreaIconStyles.tickLeft, { backgroundColor: color }]} />
+    <View style={[searchAreaIconStyles.tickHorizontal, searchAreaIconStyles.tickRight, { backgroundColor: color }]} />
   </View>
 );
 
@@ -1035,29 +1336,35 @@ const styles = StyleSheet.create({
   filterBox: { marginLeft: 10, zIndex: 100 },
   searchParkingWrapper: {
     position: "absolute",
-    top: 62,
-    left: 16,
-    right: 16,
+    top: 64,
+    left: 0,
+    right: 0,
+    alignItems: "center",
     zIndex: 80,
   },
   searchParkingBtn: {
-    backgroundColor: "#16A34A",
-    borderRadius: 16,
-    paddingVertical: 14,
+    minHeight: 42,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 22,
+    paddingVertical: 9,
+    paddingHorizontal: 18,
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
+    gap: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "rgba(15, 23, 42, 0.08)",
     shadowColor: "#0F172A",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.22,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.14,
     shadowRadius: 8,
-    elevation: 6,
+    elevation: 5,
   },
-  searchParkingBtnBusy: { backgroundColor: "#4B9E6A" },
+  searchParkingBtnBusy: { opacity: 0.72 },
   searchParkingText: {
-    color: "#ffffff",
-    fontSize: 15,
-    fontWeight: "800",
-    letterSpacing: 0.2,
+    color: "#0878F9",
+    fontSize: 14,
+    fontWeight: "600",
   },
   searchHintBox: {
     marginTop: 8,
@@ -1113,6 +1420,49 @@ const styles = StyleSheet.create({
     marginTop: 2,
     textAlign: "center",
   },
+});
+
+const searchAreaIconStyles = StyleSheet.create({
+  container: {
+    width: 20,
+    height: 20,
+    position: "relative",
+  },
+  ring: {
+    position: "absolute",
+    left: 5,
+    top: 5,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    borderWidth: 1.5,
+  },
+  dot: {
+    position: "absolute",
+    left: 8.5,
+    top: 8.5,
+    width: 3,
+    height: 3,
+    borderRadius: 1.5,
+  },
+  tickVertical: {
+    position: "absolute",
+    left: 9.25,
+    width: 1.5,
+    height: 5,
+    borderRadius: 1,
+  },
+  tickTop: { top: 0 },
+  tickBottom: { bottom: 0 },
+  tickHorizontal: {
+    position: "absolute",
+    top: 9.25,
+    width: 5,
+    height: 1.5,
+    borderRadius: 1,
+  },
+  tickLeft: { left: 0 },
+  tickRight: { right: 0 },
 });
 
 const pinStyles = StyleSheet.create({

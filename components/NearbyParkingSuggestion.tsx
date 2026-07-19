@@ -2,8 +2,9 @@ import React from 'react';
 import { TouchableOpacity, Text, View, StyleSheet, Platform } from 'react-native';
 import { OsmParking } from '../types/parking';
 import { formatDistance } from '../utils/geo';
-import { parkingName } from '../utils/parking';
+import { parkingFeeStatus, parkingName } from '../utils/parking';
 import { PARKING_ACCENT, PARKING_ACCENT_DEEP } from './ParkingMarker';
+import { AppIcon } from './AppIcon';
 
 interface Props {
   parking:        OsmParking;
@@ -23,7 +24,7 @@ interface Props {
 // what tapping the marker would — opens the same detail sheet with the same
 // "navigate" action — so there's nothing new to learn.
 export const NearbyParkingSuggestion: React.FC<Props> = ({ parking, distanceMeters, onPress }) => {
-  const fee = parking.tags.fee;
+  const fee = parkingFeeStatus(parking.tags);
 
   return (
     <TouchableOpacity
@@ -40,11 +41,17 @@ export const NearbyParkingSuggestion: React.FC<Props> = ({ parking, distanceMete
         </Text>
         <Text style={styles.subtitle} numberOfLines={1}>
           {parkingName(parking)}
-          {fee === 'no'  ? ' · Free' : ''}
-          {fee === 'yes' ? ' · Paid' : ''}
+          {fee === 'free' ? ' · Free' : ''}
+          {fee === 'paid' ? ' · Paid' : ''}
+          {fee === 'unknown' ? ' · Fee unknown' : ''}
         </Text>
       </View>
-      <Text style={styles.chevron}>›</Text>
+      <AppIcon
+        name="chevron-forward"
+        size={20}
+        color={PARKING_ACCENT_DEEP}
+        style={styles.chevron}
+      />
     </TouchableOpacity>
   );
 };
@@ -90,9 +97,6 @@ const styles = StyleSheet.create({
     marginTop:  1,
   },
   chevron: {
-    fontSize:   22,
-    fontWeight: '700',
-    color:      PARKING_ACCENT_DEEP,
     marginLeft: 2,
   },
 });

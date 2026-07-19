@@ -22,16 +22,16 @@ interface Props {
 }
 
 // ─── Custom comparator ────────────────────────────────────────────────────────
-// The only prop that changes the visible native marker is `isSelected`
-// (controls zIndex + size) and the parking identity.  Paid/free is derived
-// from the tags of a given id, which never change for that id, so the id check
-// already covers it.  All other prop churn — new `parking` reference on
-// re-fetch, stable `onPress` — is ignored to keep reconciliation O(1) per
-// selection event instead of O(n) across the whole set.
+// Fresh OSM data may update a coordinate or fee tag for an existing id. Those
+// fields are visible and must invalidate the native marker; unrelated tag or
+// geometry churn remains ignored.
 function arePropsEqual(prev: Props, next: Props): boolean {
   return (
     prev.isSelected  === next.isSelected &&
-    prev.parking.id  === next.parking.id
+    prev.parking.id  === next.parking.id &&
+    prev.parking.position.latitude === next.parking.position.latitude &&
+    prev.parking.position.longitude === next.parking.position.longitude &&
+    isPaidParking(prev.parking.tags) === isPaidParking(next.parking.tags)
   );
 }
 
@@ -48,12 +48,24 @@ function ParkingMarkerBase({
   // rasterise at 0×0 and the marker is invisible or untappable.  150 ms is
   // tight enough to avoid that glitch and short enough to release the GPU
   // pressure well before the next gesture arrives.
+  //
+  // Re-warms (not just on initial mount) whenever the rendered CONTENT
+  // changes size/colour — selection toggling on/off, or a fee-status flip.
+  // The "selected" marker slot in ParkingLayer now keeps a STABLE key across
+  // selection changes (switching zones used to remount this component
+  // entirely — real native view churn on every tap), so this component
+  // instance can persist and just re-render with new props; without
+  // re-triggering the warm-up here, tracksViewChanges would already be frozen
+  // false and the native snapshot would keep showing the OLD (wrong) size.
+  // Position changes don't need this: react-native-maps updates a Marker's
+  // `coordinate` natively without requiring a fresh raster.
   const [tracksViews, setTracksViews] = useState(true);
 
   useEffect(() => {
+    setTracksViews(true);
     const timer = setTimeout(() => setTracksViews(false), 150);
     return () => clearTimeout(timer);
-  }, []);
+  }, [parking.id, isSelected, paid]);
 
   return (
     <Marker

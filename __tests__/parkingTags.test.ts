@@ -1,4 +1,9 @@
-import { isPaidParking, parkingName } from '../utils/parking';
+import {
+  isFreeParking,
+  isPaidParking,
+  parkingFeeStatus,
+  parkingName,
+} from '../utils/parking';
 
 describe('isPaidParking classification', () => {
   it('treats fee=yes and fee=paid as paid', () => {
@@ -7,10 +12,16 @@ describe('isPaidParking classification', () => {
     expect(isPaidParking({ 'parking:fee': 'yes' })).toBe(true);
   });
 
-  it('treats fee=no and untagged as free', () => {
+  it('treats only an explicit fee=no/free as free', () => {
     expect(isPaidParking({ fee: 'no' })).toBe(false);
-    expect(isPaidParking({})).toBe(false);
-    expect(isPaidParking({ amenity: 'parking' })).toBe(false);
+    expect(isFreeParking({ fee: 'no' })).toBe(true);
+    expect(isFreeParking({ fee: 'free' })).toBe(true);
+  });
+
+  it('does not mislabel missing fee data as free', () => {
+    expect(parkingFeeStatus({})).toBe('unknown');
+    expect(parkingFeeStatus({ amenity: 'parking' })).toBe('unknown');
+    expect(isFreeParking({})).toBe(false);
   });
 });
 

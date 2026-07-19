@@ -62,9 +62,11 @@ export class NavigationEngine {
       this.resolveManeuver(travelled);
 
     const straightToDestination = haversineDistance(location, this.destination);
-    const hasArrived =
-      remainingDistance <= this.config.destinationArrivalRadiusMeters ||
-      straightToDestination <= this.config.destinationArrivalRadiusMeters;
+    // Projection clamps a point beyond the route to its final vertex, making
+    // remainingDistance zero even when the real GPS fix is hundreds of metres
+    // past or beside the destination. Arrival must therefore be confirmed by
+    // actual spatial proximity, not along-route projection alone.
+    const hasArrived = straightToDestination <= this.config.destinationArrivalRadiusMeters;
 
     const isOffRoute = proj.distanceMeters > this.config.offRouteThresholdMeters;
 

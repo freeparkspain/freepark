@@ -73,6 +73,17 @@ describe('NavigationEngine', () => {
     expect(pr.hasArrived).toBe(true);
   });
 
+  it('does not report arrival for a point far beyond the route endpoint', () => {
+    const farPastDestination = { latitude: 40, longitude: 0.02 };
+    const pr = engine.computeProgress(farPastDestination);
+
+    expect(pr.remainingDistanceMeters).toBe(0);
+    expect(haversineDistance(farPastDestination, p3)).toBeGreaterThan(
+      config.destinationArrivalRadiusMeters,
+    );
+    expect(pr.hasArrived).toBe(false);
+  });
+
   it('enforces forward-only progress via minTravelledMeters', () => {
     const pr = engine.computeProgress(p0, total * 0.8);
     expect(pr.travelledMeters).toBeGreaterThanOrEqual(total * 0.8);

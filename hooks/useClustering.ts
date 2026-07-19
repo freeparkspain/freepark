@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import Supercluster from 'supercluster';
 import { OsmParking, LatLng, BBox } from '../types/parking';
 import { deltaToZoom } from '../utils/geo';
+import { parkingClusterSignature } from '../utils/parkingCluster';
 
 // ─── Public types (unchanged — ParkingLayer depends on these) ─────────────────
 
@@ -49,14 +50,13 @@ export const useClustering = (
   viewportBounds: BBox,
 ): LayerItem[] => {
 
+  const indexSignature = parkingClusterSignature(parkings);
+
   // ── Level 1: build spatial index ──────────────────────────────────────────
-  // Rebuild ONLY when the set of parking IDs changes (new spots discovered).
-  // Geometry updates (polygon/polyline added to existing spots) change the
-  // `parkings` array reference but NOT IDs or positions — no index rebuild
-  // needed.  `parkings.length` is a safe proxy: IDs are immutable OSM
-  // identifiers that are only ever added to the module cache, never removed.
-  // ParkingLayer reads fresh geometry from its own `parkingMap` memo, so
-  // stale parking objects inside the index features are harmless.
+  // Rebuild only when IDs or positions change. Geometry/tag-only updates keep
+  // the same signature, while replacing the selected parking with a different
+  // object of equal array length still rebuilds and cannot leave a duplicate in
+  // the native marker layer.
   const index = useMemo(() => {
     const sc = new Supercluster<PointProps>({
       radius:  60,   // pixel grouping radius at each zoom level
@@ -88,7 +88,7 @@ export const useClustering = (
     );
     return sc;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parkings.length]);
+  }, [indexSignature]);
 
   // ── Level 2: query clusters for current viewport ──────────────────────────
   // Clamping zoom to [0, 20] guards against extreme latitudeDelta values.

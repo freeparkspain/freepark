@@ -56,6 +56,7 @@ export function useCarTracking(
   const lastTsRef          = useRef<number | null>(null);
   const initializedRef     = useRef(false);
   const moveAnimRef        = useRef<Animated.CompositeAnimation | null>(null);
+  const routeIndexOwnerRef = useRef<RouteIndex | null>(null);
 
   const [matchedLocation, setMatchedLocation] = useState<MatchedLocation | null>(null);
   const [carPosition, setCarPosition]         = useState<LatLng | null>(null);
@@ -63,6 +64,16 @@ export function useCarTracking(
 
   // ── Per-sample update ──────────────────────────────────────────────────────
   useEffect(() => {
+    if (routeIndexOwnerRef.current !== routeIndex) {
+      // Route effects run after render in declaration order. Reset here,
+      // synchronously before matching the first sample of a new route, so a
+      // segment index from a longer previous route can never address past the
+      // end of the new one.
+      moveAnimRef.current?.stop();
+      prevMatchRef.current = null;
+      prevMatchedPosRef.current = null;
+      routeIndexOwnerRef.current = routeIndex;
+    }
     if (!navigationActive || !rawLocation || !routeIndex) return;
 
     const raw = rawLocation.position;
@@ -148,16 +159,6 @@ export function useCarTracking(
     );
   }, [rawLocation, navigationActive, routeIndex, animatedCoordinate, rotation]);
 
-  // ── Reset match state when the ROUTE changes (reroute) ─────────────────────
-  // Clear the previous segment index so windowed matching on the NEW route
-  // doesn't search around a stale segment from the old one (which would snap the
-  // arrow to the wrong place or read as off-route). Keep the displayed
-  // position/bearing so the arrow transitions smoothly to the new route.
-  useEffect(() => {
-    prevMatchRef.current = null;
-    prevMatchedPosRef.current = null;
-  }, [routeIndex]);
-
   // ── Reset when navigation stops ────────────────────────────────────────────
   useEffect(() => {
     if (navigationActive) return;
@@ -169,6 +170,7 @@ export function useCarTracking(
     displayedBearingRef.current = 0;
     lastTsRef.current = null;
     initializedRef.current = false;
+    routeIndexOwnerRef.current = null;
     setMatchedLocation(null);
     setCarPosition(null);
     setCarBearing(0);
@@ -180,5 +182,15 @@ export function useCarTracking(
     rotation.stopAnimation();
   }, [rotation]);
 
-  return { animatedCoordinate, rotation, matchedLocation, carPosition, carBearing };
+  const currentMatchedLocation = routeIndexOwnerRef.current === routeIndex
+    ? matchedLocation
+    : null;
+
+  return {
+    animatedCoordinate,
+    rotation,
+    matchedLocation: currentMatchedLocation,
+    carPosition,
+    carBearing,
+  };
 }

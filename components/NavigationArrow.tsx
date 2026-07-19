@@ -30,14 +30,17 @@ const ArrowGlyph = memo(() => (
 ));
 
 function NavigationArrowBase({ coordinate, rotation }: Props) {
-  // Warm the raster once (so the View commits at the right size), then freeze —
-  // prevents Android bitmap caching from freezing a 0×0 frame, and keeps
-  // zoom/pan smooth since the glyph never changes afterwards.
-  const [tracks, setTracks] = useState(true);
+  // Android warms the raster once and then freezes it for smooth map movement.
+  // The single iOS car marker stays live because Google Maps may invalidate a
+  // frozen custom-marker snapshot while rebuilding overlays on repeated routes.
+  const [androidTracks, setAndroidTracks] = useState(Platform.OS === 'android');
   useEffect(() => {
-    const t = setTimeout(() => setTracks(false), 400);
+    if (Platform.OS !== 'android') return;
+    const t = setTimeout(() => setAndroidTracks(false), 400);
     return () => clearTimeout(t);
   }, []);
+
+  const tracksViewChanges = Platform.OS === 'ios' || androidTracks;
 
   return (
     <MarkerAnimated
@@ -45,7 +48,7 @@ function NavigationArrowBase({ coordinate, rotation }: Props) {
       anchor={{ x: 0.5, y: 0.5 }}
       flat
       rotation={rotation as unknown as number}
-      tracksViewChanges={tracks}
+      tracksViewChanges={tracksViewChanges}
       zIndex={100}
     >
       <ArrowGlyph />

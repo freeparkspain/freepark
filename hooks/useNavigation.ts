@@ -9,10 +9,13 @@ import {
 } from '../types/navigation';
 import { NAVIGATION_CONFIG } from '../constants/navigation';
 import { NavigationEngine } from '../navigation/navigationEngine';
+import { NavigationSessionGuard } from '../navigation/navigationSession';
 import { RerouteController } from '../navigation/rerouteController';
 import { VoiceGuidanceManager } from '../navigation/voiceGuidanceManager';
 import { ExpoLocationProvider, LocationProvider } from '../navigation/locationProvider';
 import { etaEpochMs } from '../navigation/format';
+import { isFreshLocationSample, isValidLocationSample } from '../navigation/locationValidation';
+import { isUsablePreparedNavigationRoute } from '../navigation/services/routeValidator';
 import {
   createDefaultNavigationRepository,
   NavigationRepository,
@@ -31,7 +34,12 @@ export interface UseNavigation {
   location:    LocationSample | null;
   destination: LatLng | null;
   isActive:    boolean;
+  /** Increments for every explicit user start/restart. */
+  sessionRevision: number;
+  /** Increments whenever a new native route should be rendered. */
+  routeRevision:   number;
   start:        (destination: LatLng) => Promise<void>;
+  startPrepared: (destination: LatLng, route: NavigationRoute) => Promise<void>;
   stop:         () => void;
   toggleMute:   () => void;
   setFollowing: (following: boolean) => void;
@@ -59,7 +67,7 @@ export function useNavigation(deps?: {
   const rerouteRef          = useRef<RerouteController | null>(null);
   const destinationRef      = useRef<LatLng | null>(null);
   const travelledRef        = useRef(0);
-  const watchStopRef        = useRef<() => void>(() => {});
+  const sessionGuardRef     = useRef(new NavigationSessionGuard());
   const routeAbortRef       = useRef<AbortController | null>(null);
   // Monotonic id shared by the initial fetch and every reroute: only the newest
   // request may commit a route, so a slow/stale response can't clobber a fresher
@@ -76,6 +84,8 @@ export function useNavigation(deps?: {
   const [route, setRoute]        = useState<NavigationRoute | null>(null);
   const [location, setLocation]  = useState<LocationSample | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
+  const [sessionRevision, setSessionRevision] = useState(0);
+  const [routeRevision, setRouteRevision] = useState(0);
 
   const apply = useCallback((s: NavigationState) => {
     stateRef.current = s;
@@ -102,10 +112,13 @@ export function useNavigation(deps?: {
 
   const teardown = useCallback(() => {
     activeRef.current = false;
-    watchStopRef.current();
-    watchStopRef.current = () => {};
+    sessionGuardRef.current.invalidate();
+    // Invalidate even a repository that does not honour AbortSignal.
+    routeRequestIdRef.current++;
     routeAbortRef.current?.abort();
     routeAbortRef.current = null;
+    engineRef.current = null;
+    rerouteRef.current = null;
     rerouteInFlightRef.current = false;
     isReroutingRef.current = false;
     voiceRef.current.dispose();
@@ -114,24 +127,30 @@ export function useNavigation(deps?: {
   const applyRoute = useCallback((newRoute: NavigationRoute) => {
     engineRef.current = new NavigationEngine(newRoute, config);
     travelledRef.current = 0;
-    rerouteRef.current?.reset();
     voiceRef.current.reset();
     setRoute(newRoute);
+    setRouteRevision((revision) => revision + 1);
   }, [config]);
 
-  const finishArrived = useCallback(() => {
+  const finishArrived = useCallback((sessionId: number) => {
+    if (!sessionGuardRef.current.isCurrent(sessionId)) return;
     const dest = destinationRef.current;
-    voiceRef.current.announceNow('You have arrived at your destination');
     teardown();
+    // Announce after teardown, whose dispose() intentionally stops any stale
+    // maneuver prompt. Otherwise the arrival phrase is cancelled immediately.
+    voiceRef.current.announceNow('You have arrived at your destination');
     if (dest) apply({ kind: 'arrived', destination: dest });
   }, [apply, teardown]);
 
-  const triggerReroute = useCallback(async (sample: LocationSample) => {
-    if (rerouteInFlightRef.current || !destinationRef.current) return;
+  const triggerReroute = useCallback(async (sample: LocationSample, sessionId: number) => {
+    if (
+      !sessionGuardRef.current.isCurrent(sessionId) ||
+      rerouteInFlightRef.current ||
+      !destinationRef.current
+    ) return;
     rerouteInFlightRef.current = true;
     isReroutingRef.current = true;
     rerouteRef.current?.markRerouted(sample.timestampMs);
-    voiceRef.current.announceNow('Route recalculated');
     if (stateRef.current.kind === 'navigating') {
       apply({ ...stateRef.current, isRerouting: true });
     }
@@ -147,21 +166,33 @@ export function useNavigation(deps?: {
         destinationRef.current,
         ctrl.signal,
       );
-      if (routeRequestIdRef.current !== reqId || !activeRef.current) return;
+      if (
+        routeRequestIdRef.current !== reqId ||
+        !activeRef.current ||
+        !sessionGuardRef.current.isCurrent(sessionId)
+      ) return;
       applyRoute(fresh);
+      voiceRef.current.announceNow('Route recalculated');
     } catch (err) {
       // Aborted (superseded) or failed — keep guiding on the existing route.
       if (err instanceof Error && err.name === 'AbortError') return;
     } finally {
-      rerouteInFlightRef.current = false;
-      isReroutingRef.current = false;
-      if (stateRef.current.kind === 'navigating') {
-        apply({ ...stateRef.current, isRerouting: false });
+      if (sessionGuardRef.current.isCurrent(sessionId)) {
+        if (routeAbortRef.current === ctrl) routeAbortRef.current = null;
+        rerouteInFlightRef.current = false;
+        isReroutingRef.current = false;
+        if (stateRef.current.kind === 'navigating') {
+          apply({ ...stateRef.current, isRerouting: false });
+        }
       }
     }
   }, [apply, applyRoute]);
 
-  const handleSample = useCallback((sample: LocationSample) => {
+  const handleSample = useCallback((sample: LocationSample, sessionId: number) => {
+    if (
+      !sessionGuardRef.current.isCurrent(sessionId) ||
+      !isValidLocationSample(sample)
+    ) return;
     const engine = engineRef.current;
     if (!activeRef.current || !engine) return;
 
@@ -171,7 +202,7 @@ export function useNavigation(deps?: {
     travelledRef.current = progress.travelledMeters;
 
     if (progress.hasArrived) {
-      finishArrived();
+      finishArrived(sessionId);
       return;
     }
 
@@ -192,23 +223,30 @@ export function useNavigation(deps?: {
       sample.accuracyMeters == null || sample.accuracyMeters <= config.maxUsableAccuracyMeters;
     const offRoute = progress.isOffRoute && accuracyOk;
     if (rerouteRef.current?.update(offRoute, sample.timestampMs)) {
-      void triggerReroute(sample);
+      void triggerReroute(sample, sessionId);
     }
   }, [apply, buildNavigating, config.maxUsableAccuracyMeters, finishArrived, triggerReroute]);
 
-  const onLocationError = useCallback((err: NavigationError) => {
-    // Only surface as a hard error before we're navigating; transient signal
-    // loss mid-route shouldn't tear down the active guidance UI.
-    if (stateRef.current.kind !== 'navigating') {
-      apply({ kind: 'error', message: err.message, recoverable: err.recoverable });
-    }
-  }, [apply]);
-
-  const start = useCallback(async (dest: LatLng) => {
+  const onLocationError = useCallback((err: NavigationError, sessionId: number) => {
+    if (!sessionGuardRef.current.isCurrent(sessionId)) return;
+    // Expo's watcher error callback is used for setup/service failures, not for
+    // ordinary accuracy fluctuations. Continuing would leave a route UI with no
+    // live car updates, so terminate this session and offer Retry.
     teardown();
+    apply({ kind: 'error', message: err.message, recoverable: err.recoverable });
+  }, [apply, teardown]);
+
+  const startInternal = useCallback(async (
+    dest: LatLng,
+    preparedRoute: NavigationRoute | null,
+  ) => {
+    teardown();
+    const sessionId = sessionGuardRef.current.begin();
+    setSessionRevision((revision) => revision + 1);
     activeRef.current = true;
     destinationRef.current = dest;
     setDestination(dest);
+    setLocation(null);
     travelledRef.current = 0;
     isMutedRef.current = false;
     isFollowingRef.current = true;
@@ -220,47 +258,84 @@ export function useNavigation(deps?: {
 
     apply({ kind: 'requestingLocation' });
     const granted = await providerRef.current.ensurePermission();
+    if (!sessionGuardRef.current.isCurrent(sessionId)) return;
     if (!granted) {
       activeRef.current = false;
+      sessionGuardRef.current.complete(sessionId);
       apply({ kind: 'error', message: 'Location access denied. Enable it in Settings', recoverable: true });
       return;
     }
 
     const current = await providerRef.current.getCurrent();
-    if (!current) {
+    if (!sessionGuardRef.current.isCurrent(sessionId)) return;
+    if (!current || !isFreshLocationSample(current, Date.now())) {
       activeRef.current = false;
+      sessionGuardRef.current.complete(sessionId);
       apply({ kind: 'error', message: 'Could not determine your location. Check your GPS', recoverable: true });
       return;
     }
     setLocation(current);
 
     apply({ kind: 'buildingRoute' });
-    routeAbortRef.current?.abort();
-    const ctrl = new AbortController();
-    routeAbortRef.current = ctrl;
-    const reqId = ++routeRequestIdRef.current;
-
+    const preparedIsUsable = isUsablePreparedNavigationRoute(preparedRoute);
     let initial: NavigationRoute;
-    try {
-      initial = await repositoryRef.current.getRoute(current.position, dest, ctrl.signal);
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return;
-      if (routeRequestIdRef.current !== reqId) return; // superseded — ignore
-      activeRef.current = false;
-      const message = err instanceof NavigationError ? err.message : 'Could not build the route';
-      const recoverable = err instanceof NavigationError ? err.recoverable : true;
-      apply({ kind: 'error', message, recoverable });
-      return;
+
+    if (preparedIsUsable) {
+      initial = preparedRoute!;
+    } else {
+      routeAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      routeAbortRef.current = ctrl;
+      const reqId = ++routeRequestIdRef.current;
+      try {
+        initial = await repositoryRef.current.getRoute(current.position, dest, ctrl.signal);
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        if (
+          routeRequestIdRef.current !== reqId ||
+          !sessionGuardRef.current.isCurrent(sessionId)
+        ) return;
+        activeRef.current = false;
+        sessionGuardRef.current.complete(sessionId);
+        const message = err instanceof NavigationError ? err.message : 'Could not build the route';
+        const recoverable = err instanceof NavigationError ? err.recoverable : true;
+        apply({ kind: 'error', message, recoverable });
+        return;
+      }
+      if (routeRequestIdRef.current !== reqId) return;
+      if (routeAbortRef.current === ctrl) routeAbortRef.current = null;
     }
-    if (routeRequestIdRef.current !== reqId || !activeRef.current) return;
+
+    if (!activeRef.current || !sessionGuardRef.current.isCurrent(sessionId)) return;
 
     applyRoute(initial);
     const progress = engineRef.current!.computeProgress(current.position, 0);
     travelledRef.current = progress.travelledMeters;
     apply(buildNavigating(progress));
 
-    watchStopRef.current = await providerRef.current.watch(handleSample, onLocationError);
+    try {
+      const stopWatch = await providerRef.current.watch(
+        (sample) => handleSample(sample, sessionId),
+        (error) => onLocationError(error, sessionId),
+      );
+      sessionGuardRef.current.adoptWatch(sessionId, stopWatch);
+    } catch {
+      onLocationError(
+        new NavigationError('Could not start live location tracking', true),
+        sessionId,
+      );
+    }
   }, [apply, applyRoute, buildNavigating, config, handleSample, onLocationError, teardown]);
+
+  const start = useCallback(
+    (dest: LatLng) => startInternal(dest, null),
+    [startInternal],
+  );
+
+  const startPrepared = useCallback(
+    (dest: LatLng, preparedRoute: NavigationRoute) => startInternal(dest, preparedRoute),
+    [startInternal],
+  );
 
   const stop = useCallback(() => {
     teardown();
@@ -298,7 +373,10 @@ export function useNavigation(deps?: {
     location,
     destination,
     isActive: state.kind !== 'idle',
+    sessionRevision,
+    routeRevision,
     start,
+    startPrepared,
     stop,
     toggleMute,
     setFollowing,

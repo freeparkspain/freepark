@@ -15,6 +15,18 @@ export interface OsrmApiService {
   ): Promise<OsrmRouteResponse>;
 }
 
+export function buildOsrmRouteUrl(
+  config: RoutingConfig,
+  origin: LatLng,
+  destination: LatLng,
+): string {
+  const coordinates =
+    `${origin.longitude},${origin.latitude};` +
+    `${destination.longitude},${destination.latitude}`;
+  return `${config.baseUrl}/route/v1/driving/${coordinates}` +
+    '?overview=full&geometries=polyline6&steps=true&alternatives=3';
+}
+
 export class OsrmHttpApiService implements OsrmApiService {
   constructor(private readonly config: RoutingConfig) {}
 
@@ -24,12 +36,7 @@ export class OsrmHttpApiService implements OsrmApiService {
     signal?: AbortSignal,
   ): Promise<OsrmRouteResponse> {
     // OSRM expects longitude,latitude — the OPPOSITE of Google's lat,lng.
-    const coords =
-      `${origin.longitude},${origin.latitude};` +
-      `${destination.longitude},${destination.latitude}`;
-    const url =
-      `${this.config.baseUrl}/route/v1/driving/${coords}` +
-      `?overview=full&geometries=polyline6&steps=true&alternatives=false`;
+    const url = buildOsrmRouteUrl(this.config, origin, destination);
 
     // Combine an internal timeout with any caller-provided abort signal, so a
     // reroute superseding an in-flight request cancels it immediately.

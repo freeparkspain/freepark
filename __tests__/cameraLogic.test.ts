@@ -4,6 +4,7 @@ import {
   drivingZoom,
   resolveRecenterBearing,
   shouldEnterFreeMode,
+  shouldFocusNavigationSession,
 } from '../navigation/services/cameraLogic';
 import { MapViewportLayout } from '../types/navigation';
 
@@ -85,12 +86,38 @@ describe('drivingZoom', () => {
     expect(arterial).toBeLessThan(city);
     expect(highway).toBeLessThan(arterial);
   });
+
+  it('changes smoothly around speed thresholds', () => {
+    expect(Math.abs(drivingZoom(4.01, base) - drivingZoom(3.99, base))).toBeLessThan(0.02);
+    expect(Math.abs(drivingZoom(9.01, base) - drivingZoom(8.99, base))).toBeLessThan(0.02);
+    expect(Math.abs(drivingZoom(16.01, base) - drivingZoom(15.99, base))).toBeLessThan(0.02);
+  });
+
+  it('gently zooms in for an approaching maneuver without exceeding the cap', () => {
+    expect(drivingZoom(3, base, 75)).toBeGreaterThan(drivingZoom(3, base, 200));
+    expect(drivingZoom(0, base, 0)).toBeLessThanOrEqual(base + 0.5);
+  });
 });
 
 describe('shouldEnterFreeMode', () => {
   it('enters free only for a genuine user gesture while following', () => {
-    expect(shouldEnterFreeMode(false, 'following')).toBe(true);
-    expect(shouldEnterFreeMode(true, 'following')).toBe(false); // programmatic
-    expect(shouldEnterFreeMode(false, 'free')).toBe(false);     // already free
+    expect(shouldEnterFreeMode(true, 'following')).toBe(true);
+    expect(shouldEnterFreeMode(false, 'following')).toBe(false);
+    expect(shouldEnterFreeMode(undefined, 'following')).toBe(false);
+    expect(shouldEnterFreeMode(true, 'free')).toBe(false);
+  });
+});
+
+describe('shouldFocusNavigationSession', () => {
+  it('focuses once when a new session has both route and car position', () => {
+    expect(shouldFocusNavigationSession(true, 2, true, 4, null)).toBe(true);
+    expect(shouldFocusNavigationSession(true, 2, true, 4, 4)).toBe(false);
+    expect(shouldFocusNavigationSession(true, 2, true, 5, 4)).toBe(true);
+  });
+
+  it('waits until navigation, route and car position are ready', () => {
+    expect(shouldFocusNavigationSession(false, 2, true, 1, null)).toBe(false);
+    expect(shouldFocusNavigationSession(true, 1, true, 1, null)).toBe(false);
+    expect(shouldFocusNavigationSession(true, 2, false, 1, null)).toBe(false);
   });
 });

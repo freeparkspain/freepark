@@ -61,12 +61,26 @@ export function computeMapPadding(layout: MapViewportLayout, ratio: number): Map
  * road ahead: city speed keeps the base zoom; faster travel zooms out so more
  * of the route ahead is visible (like professional nav apps).
  */
-export function drivingZoom(speedMps: number | null, baseZoom: number): number {
-  const s = speedMps ?? 0;
-  if (s > 16) return baseZoom - 1.8; // > ~58 km/h — highway
-  if (s > 9)  return baseZoom - 1.0; // ~32–58 km/h — arterial
-  if (s > 4)  return baseZoom - 0.4; // ~14–32 km/h — city
-  return baseZoom;                    // slow / stopped
+export function drivingZoom(
+  speedMps: number | null,
+  baseZoom: number,
+  distanceToNextManeuverMeters: number | null = null,
+): number {
+  const speed = Math.max(0, speedMps ?? 0);
+  let zoomOut = 0;
+  if (speed > 16) {
+    zoomOut = 1.2 + Math.min(0.8, ((speed - 16) / 14) * 0.8);
+  } else if (speed > 9) {
+    zoomOut = 0.5 + ((speed - 9) / 7) * 0.7;
+  } else if (speed > 4) {
+    zoomOut = ((speed - 4) / 5) * 0.5;
+  }
+
+  const maneuverDistance = distanceToNextManeuverMeters ?? Number.POSITIVE_INFINITY;
+  const approachZoom = maneuverDistance < 150
+    ? 0.5 * (1 - Math.max(0, maneuverDistance) / 150)
+    : 0;
+  return Math.min(baseZoom + 0.5, baseZoom - zoomOut + approachZoom);
 }
 
 /** Default padding for normal (non-following) map use. */
@@ -81,11 +95,25 @@ export function defaultMapPadding(layout: MapViewportLayout): MapEdgePadding {
 
 /**
  * Whether a camera region change should flip us into free mode: only when we're
- * currently following AND the move was NOT one we triggered programmatically.
+ * following and Google Maps explicitly reports a user gesture.
  */
 export function shouldEnterFreeMode(
-  isProgrammatic: boolean,
+  isGesture: boolean | undefined,
   mode: NavigationCameraMode,
 ): boolean {
-  return mode === 'following' && !isProgrammatic;
+  return mode === 'following' && isGesture === true;
+}
+
+/** One start-focus per explicit navigation session, once route and car exist. */
+export function shouldFocusNavigationSession(
+  navigationActive: boolean,
+  routePointCount: number,
+  hasCarPosition: boolean,
+  sessionRevision: number,
+  focusedSessionRevision: number | null,
+): boolean {
+  return navigationActive &&
+    routePointCount >= 2 &&
+    hasCarPosition &&
+    focusedSessionRevision !== sessionRevision;
 }

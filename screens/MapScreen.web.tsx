@@ -1,13 +1,14 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { FilterToggle } from '../components/FilterToggle';
+import { AppIcon } from '../components/AppIcon';
 
 // react-native-maps does not support web. This file is picked up by Metro
 // automatically for the web platform instead of MapScreen.tsx.
 export const MapScreen: React.FC = () => (
   <View style={styles.container}>
     <View style={styles.notice}>
-      <Text style={styles.icon}>🗺️</Text>
+      <AppIcon name="map-outline" size={64} color="#0A67D8" />
       <Text style={styles.title}>Map unavailable on web</Text>
       <Text style={styles.body}>
         react-native-maps only works on iOS and Android.{'\n'}
@@ -30,7 +31,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 32,
     gap: 12,
   },
-  icon: { fontSize: 64 },
   title: { fontSize: 20, fontWeight: '700', color: '#111827', textAlign: 'center' },
   body: { fontSize: 14, color: '#6B7280', textAlign: 'center', lineHeight: 22 },
 });

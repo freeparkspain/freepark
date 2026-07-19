@@ -1,4 +1,5 @@
 import { LatLng } from '../../types/parking';
+import type { NavigationRoute } from '../../types/navigation';
 import { haversineDistance } from '../../utils/geo';
 
 // ─── Route validation (pure, framework-free) ──────────────────────────────────
@@ -68,6 +69,21 @@ export function validateRouteGeometry(coords: unknown): RouteValidation {
     return { ok: false, reason: 'The route data is invalid.', coordinates: [] };
   }
   return { ok: true, reason: null, coordinates: sanitized };
+}
+
+/** A preview route is safe to reuse when turn-by-turn navigation starts. */
+export function isUsablePreparedNavigationRoute(
+  route: NavigationRoute | null | undefined,
+): route is NavigationRoute {
+  return Boolean(
+    route &&
+    validateRouteGeometry(route.points).ok &&
+    route.steps.length > 0 &&
+    Number.isFinite(route.totalDistanceMeters) &&
+    route.totalDistanceMeters >= 0 &&
+    Number.isFinite(route.totalDurationSeconds) &&
+    route.totalDurationSeconds >= 0
+  );
 }
 
 /**

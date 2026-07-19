@@ -1,6 +1,7 @@
 import {
   isValidCoordinate,
   isValidBounds,
+  isUsablePreparedNavigationRoute,
   sanitizeRouteCoordinates,
   validateRouteGeometry,
 } from '../navigation/services/routeValidator';
@@ -98,6 +99,34 @@ describe('validateRouteGeometry', () => {
       { latitude: 40, longitude: 0 },
       { latitude: 40, longitude: 0 },
     ]).ok).toBe(false);
+  });
+});
+
+describe('isUsablePreparedNavigationRoute', () => {
+  const route = {
+    points: [
+      { latitude: 40, longitude: 0 },
+      { latitude: 40, longitude: 0.01 },
+    ],
+    steps: [{
+      instruction: 'Continue',
+      maneuverLocation: { latitude: 40, longitude: 0 },
+      distanceMeters: 850,
+      durationSeconds: 90,
+      maneuverType: 'continue',
+      maneuverModifier: null,
+      streetName: null,
+      exit: null,
+    }],
+    totalDistanceMeters: 850,
+    totalDurationSeconds: 90,
+  };
+
+  it('accepts a complete preview route and rejects incomplete data', () => {
+    expect(isUsablePreparedNavigationRoute(route)).toBe(true);
+    expect(isUsablePreparedNavigationRoute({ ...route, points: [route.points[0]] })).toBe(false);
+    expect(isUsablePreparedNavigationRoute({ ...route, steps: [] })).toBe(false);
+    expect(isUsablePreparedNavigationRoute({ ...route, totalDurationSeconds: NaN })).toBe(false);
   });
 });
 

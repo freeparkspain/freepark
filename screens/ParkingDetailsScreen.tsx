@@ -3,6 +3,7 @@ import { View, Text, ScrollView } from 'react-native';
 import { RouteProp, useRoute } from '@react-navigation/native';
 import { useParkingStore } from '../store/useParkingStore';
 import { ParkingType, RootStackParamList } from '../types/parking';
+import { AppIcon, AppIconName } from '../components/AppIcon';
 
 type ParkingDetailsRouteProp = RouteProp<RootStackParamList, 'ParkingDetails'>;
 
@@ -19,14 +20,19 @@ const TYPE_BADGE: Record<ParkingType, string> = {
 };
 
 interface InfoRowProps {
-  icon: string;
+  icon: AppIconName;
   label: string;
   value: string;
 }
 
 const InfoRow: React.FC<InfoRowProps> = ({ icon, label, value }) => (
   <View className="flex-row items-start py-3 border-b border-gray-100">
-    <Text className="text-base mr-3 mt-0.5">{icon}</Text>
+    <AppIcon
+      name={icon}
+      size={19}
+      color="#64748B"
+      style={{ marginRight: 12, marginTop: 2 }}
+    />
     <View className="flex-1">
       <Text className="text-xs text-gray-400 uppercase tracking-wider mb-0.5">{label}</Text>
       <Text className="text-sm text-gray-800 font-medium leading-5">{value}</Text>
@@ -69,20 +75,20 @@ export const ParkingDetailsScreen: React.FC = () => {
         {/* Info rows */}
         <View className="bg-gray-50 rounded-2xl px-4 pt-1 pb-2">
           {spot.address && (
-            <InfoRow icon="📍" label="Address" value={spot.address} />
+            <InfoRow icon="location-outline" label="Address" value={spot.address} />
           )}
           {spot.maxHours != null && (
             <InfoRow
-              icon="⏱"
+              icon="time-outline"
               label="Max Hours"
               value={`${spot.maxHours} ${spot.maxHours === 1 ? 'hour' : 'hours'}`}
             />
           )}
           {spot.notes && (
-            <InfoRow icon="📝" label="Notes" value={spot.notes} />
+            <InfoRow icon="document-text-outline" label="Notes" value={spot.notes} />
           )}
           <InfoRow
-            icon="🗺"
+            icon="map-outline"
             label="Coordinates"
             value={`${spot.latitude.toFixed(5)}°N, ${Math.abs(spot.longitude).toFixed(5)}°W`}
           />

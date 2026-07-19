@@ -3,6 +3,7 @@ import {
   zoomFromDelta,
   LOD_MEDIUM_MIN_ZOOM,
   LOD_HIGH_MIN_ZOOM,
+  PARKING_LOD_PRESENTATION,
 } from '../constants/parkingLod';
 
 // Exact latitudeDelta that maps to a given Web-Mercator zoom (inverse of
@@ -46,5 +47,23 @@ describe('parking Level of Detail thresholds', () => {
     expect(Number.isFinite(zoomFromDelta(NaN))).toBe(true);
     // z=14 sits just under the medium boundary+hysteresis → stays low from low.
     expect(getParkingLod(0, 'low')).toBe('low');
+  });
+
+  it('keeps marker and zone rendering mutually exclusive', () => {
+    expect(PARKING_LOD_PRESENTATION.low).toEqual({
+      showMarkers: true,
+      showZones: false,
+      simplifyZones: false,
+    });
+    expect(PARKING_LOD_PRESENTATION.medium).toEqual({
+      showMarkers: false,
+      showZones: true,
+      simplifyZones: true,
+    });
+    expect(PARKING_LOD_PRESENTATION.high).toEqual({
+      showMarkers: false,
+      showZones: true,
+      simplifyZones: false,
+    });
   });
 });

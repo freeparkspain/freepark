@@ -27,9 +27,12 @@ export const NAV_ROUTE_STYLE: NavigationRouteStyle = {
   highlightWidth: 2,
   highlightColor: 'rgba(255, 255, 255, 0.5)',
   // Completed trail: muted slate drawn OVER the accent so the travelled part
-  // reads as "done" and attention stays on the road ahead.
-  completedWidth: 7.5,
-  completedColor: 'rgba(100, 116, 139, 0.75)',
+  // reads as "done" and attention stays on the road ahead. Must be AT LEAST as
+  // wide as casingWidth — a narrower overlay (it used to match mainWidth, 7.5)
+  // left a sliver of the dark casing halo visible on both edges of the
+  // "completed" section, so the driven part never looked fully gone.
+  completedWidth: 13,
+  completedColor: 'rgba(100, 116, 139, 0.82)',
 };
 
 // Stable z-indices so layers never reorder / flicker during camera movement.

@@ -5,45 +5,54 @@ import {
 } from 'react-native';
 import { SelectedDestination, RouteInfo, LatLng } from '../types/parking';
 import { formatDistance, formatDuration, haversineDistance } from '../utils/geo';
+import type { ParkingFeeStatus } from '../utils/parking';
+import { AppIcon, AppIconName } from './AppIcon';
 
 interface Props {
   destination:       SelectedDestination | null;
-  /** Paid/free status for a parking destination (null when N/A). Surfaces the
-   *  existing OSM fee classification in the info sheet. */
-  parkingPaid?:      boolean | null;
-  activeRoute:       boolean;
+  /** Explicit OSM fee classification; missing tags remain honestly unknown. */
+  parkingFeeStatus?: ParkingFeeStatus | null;
+  parkingAccessLabel?: string | null;
+  parkingAccessLoading?: boolean;
+  previewStatus:     'idle' | 'building' | 'ready' | 'error';
   routeInfo:         RouteInfo | null;
   userLocation:      LatLng | null;
   canNavigate:       boolean;
   routeError:        string | null;
   locationDenied:    boolean;
+  onPreviewRoute:    () => void;
   onStartRoute:      () => void;
-  onCancelRoute:     () => void;
   onRequestLocation: () => void;
   onClose:           () => void;
 }
 
-// Compact sheet — the destination card only needs the title, one distance line
-// and the Start Route button, so keep it short and low so it covers little map.
-export const SHEET_HEIGHT = 196;
+// Compact two-stage sheet: show the full route first, then explicitly start
+// turn-by-turn guidance without covering much of the map.
+export const SHEET_HEIGHT = Platform.OS === 'ios' ? 264 : 248;
 const ACCENT              = '#007AFF';
 
-const TYPE_ICON: Record<SelectedDestination['type'], string> = {
-  parking: '🅿️',
-  search:  '🔍',
-  pin:     '📍',
+const TYPE_ICON: Record<SelectedDestination['type'], AppIconName> = {
+  parking: 'car-outline',
+  search:  'search-outline',
+  pin:     'location-outline',
 };
 
 export const RouteBottomSheet: React.FC<Props> = ({
-  destination, parkingPaid, activeRoute, routeInfo, userLocation, canNavigate, routeError,
-  locationDenied, onStartRoute, onCancelRoute, onRequestLocation, onClose,
+  destination, parkingFeeStatus, parkingAccessLabel, parkingAccessLoading = false,
+  previewStatus, routeInfo, userLocation, canNavigate, routeError,
+  locationDenied, onPreviewRoute, onStartRoute, onRequestLocation, onClose,
 }) => {
   const translateY = useRef(new Animated.Value(SHEET_HEIGHT)).current;
 
   useEffect(() => {
     Animated.spring(translateY, {
       toValue:         destination ? 0 : SHEET_HEIGHT,
-      friction:        9,
+      // Damping ratio ζ = friction / (2·√tension) — the old friction:9 at this
+      // tension gives ζ≈0.41 (well under 1, i.e. underdamped), so the sheet
+      // visibly overshot and bounced once before settling on every open/close.
+      // friction:20 brings ζ≈0.91 (just under critical) — a fast, fluid slide
+      // with no visible bounce.
+      friction:        20,
       tension:         120,
       useNativeDriver: true,
     }).start();
@@ -53,13 +62,15 @@ export const RouteBottomSheet: React.FC<Props> = ({
     ? haversineDistance(userLocation, destination.position)
     : null;
 
-  // Start Route stays enabled as long as an in-app provider exists — it
-  // acquires the location on demand when pressed, so we never sit disabled on
-  // "Waiting for location…". It's only truly blocked with no provider at all.
-  const startDisabled = !canNavigate;
-  const startLabel    = !canNavigate
-    ? '⚙️ No route provider configured'
-    : '🗺 Start Route';
+  // Location is acquired on demand. Parking waits for its final route target so
+  // the preview and the navigation session always share the same destination.
+  const previewDisabled = !canNavigate || parkingAccessLoading;
+  const previewLabel = parkingAccessLoading
+    ? 'Preparing destination…'
+    : !canNavigate
+      ? 'No route provider configured'
+      : 'Show Route';
+  const previewIcon: AppIconName = !canNavigate ? 'settings-outline' : 'map-outline';
 
   return (
     <Animated.View
@@ -71,24 +82,58 @@ export const RouteBottomSheet: React.FC<Props> = ({
           <View style={styles.handle} />
 
           <View style={styles.header}>
-            <Text style={styles.typeIcon}>{TYPE_ICON[destination.type]}</Text>
+            <View style={styles.typeIcon}>
+              <AppIcon name={TYPE_ICON[destination.type]} size={19} color="#0A67D8" />
+            </View>
             <Text style={styles.title} numberOfLines={1}>{destination.title}</Text>
-            <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <Text style={styles.closeIcon}>✕</Text>
+            <TouchableOpacity
+              onPress={onClose}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              accessibilityRole="button"
+              accessibilityLabel="Close destination details"
+            >
+              <AppIcon name="close" size={21} color="#64748B" />
             </TouchableOpacity>
           </View>
 
           {/* Paid/free badge — only for parking destinations, from existing OSM
               tags (no invented data). Blue = free, orange = paid (matches map). */}
-          {destination.type === 'parking' && parkingPaid != null && (
-            <View style={[styles.parkingBadge, parkingPaid ? styles.parkingBadgePaid : styles.parkingBadgeFree]}>
-              <Text style={[styles.parkingBadgeText, parkingPaid ? styles.parkingBadgeTextPaid : styles.parkingBadgeTextFree]}>
-                {parkingPaid ? '€ Paid parking' : 'P Free parking'}
+          {destination.type === 'parking' && parkingFeeStatus != null && (
+            <View style={[
+              styles.parkingBadge,
+              parkingFeeStatus === 'paid'
+                ? styles.parkingBadgePaid
+                : parkingFeeStatus === 'free'
+                  ? styles.parkingBadgeFree
+                  : styles.parkingBadgeUnknown,
+            ]}>
+              <Text style={[
+                styles.parkingBadgeText,
+                parkingFeeStatus === 'paid'
+                  ? styles.parkingBadgeTextPaid
+                  : parkingFeeStatus === 'free'
+                    ? styles.parkingBadgeTextFree
+                    : styles.parkingBadgeTextUnknown,
+              ]}>
+                {parkingFeeStatus === 'paid'
+                  ? '€ Paid parking'
+                  : parkingFeeStatus === 'free'
+                    ? 'P Free parking'
+                    : 'P Fee unknown'}
               </Text>
             </View>
           )}
 
-          {!activeRoute ? (
+          {destination.type === 'parking' && (parkingAccessLoading || parkingAccessLabel) && (
+            <View style={styles.accessRow}>
+              <View style={styles.accessDot} />
+              <Text style={styles.accessText} numberOfLines={1}>
+                {parkingAccessLoading ? 'Preparing route destination…' : parkingAccessLabel}
+              </Text>
+            </View>
+          )}
+
+          {previewStatus === 'idle' && (
             <>
               {straightDist !== null ? (
                 <Text style={styles.distance}>
@@ -96,45 +141,68 @@ export const RouteBottomSheet: React.FC<Props> = ({
                 </Text>
               ) : locationDenied ? (
                 <TouchableOpacity onPress={onRequestLocation} activeOpacity={0.7}>
-                  <Text style={styles.locationHint}>
-                    📍 Location is off — tap to enable for in-app routing
-                  </Text>
+                  <View style={styles.locationHint}>
+                    <AppIcon name="location-outline" size={17} color="#92400E" />
+                    <Text style={styles.locationHintText}>
+                      Location is off — tap to enable for in-app routing
+                    </Text>
+                  </View>
                 </TouchableOpacity>
               ) : (
-                <Text style={styles.distance}>📍 Locating you…</Text>
+                <View style={styles.inlineStatus}>
+                  <AppIcon name="locate-outline" size={16} color="#64748B" />
+                  <Text style={styles.distanceText}>Locating you…</Text>
+                </View>
               )}
 
               <TouchableOpacity
-                style={[styles.routeBtn, { backgroundColor: startDisabled ? '#9CA3AF' : ACCENT }]}
-                onPress={startDisabled ? undefined : onStartRoute}
-                activeOpacity={startDisabled ? 1 : 0.85}
-                disabled={startDisabled}
+                style={[styles.routeBtn, { backgroundColor: previewDisabled ? '#9CA3AF' : ACCENT }]}
+                onPress={previewDisabled ? undefined : onPreviewRoute}
+                activeOpacity={previewDisabled ? 1 : 0.85}
+                disabled={previewDisabled}
               >
-                <Text style={styles.routeBtnText}>{startLabel}</Text>
+                <AppIcon name={previewIcon} size={19} color="#FFFFFF" />
+                <Text style={styles.routeBtnText}>{previewLabel}</Text>
               </TouchableOpacity>
             </>
-          ) : (
-            <>
-              {routeError ? (
-                <Text style={styles.errorText}>⚠️ Route unavailable · showing direct line</Text>
-              ) : routeInfo ? (
-                <View style={styles.etaRow}>
-                  <View style={styles.etaCard}>
-                    <Text style={styles.etaValue}>{formatDistance(routeInfo.distance)}</Text>
-                    <Text style={styles.etaLabel}>distance</Text>
-                  </View>
-                  <View style={styles.etaSep} />
-                  <View style={styles.etaCard}>
-                    <Text style={styles.etaValue}>{formatDuration(routeInfo.duration)}</Text>
-                    <Text style={styles.etaLabel}>travel time</Text>
-                  </View>
-                </View>
-              ) : (
-                <Text style={styles.calculating}>⏳ Calculating route…</Text>
-              )}
+          )}
 
-              <TouchableOpacity style={styles.cancelBtn} onPress={onCancelRoute} activeOpacity={0.85}>
-                <Text style={styles.cancelBtnText}>✕  Cancel Route</Text>
+          {previewStatus === 'building' && (
+            <View style={styles.calculating}>
+              <AppIcon name="time-outline" size={17} color="#64748B" />
+              <Text style={styles.calculatingText}>Building route…</Text>
+            </View>
+          )}
+
+          {previewStatus === 'error' && (
+            <>
+              <View style={styles.errorBox}>
+                <AppIcon name="warning-outline" size={17} color="#92400E" />
+                <Text style={styles.errorText}>{routeError || 'Route unavailable'}</Text>
+              </View>
+              <TouchableOpacity style={styles.routeBtn} onPress={onPreviewRoute} activeOpacity={0.85}>
+                <AppIcon name="refresh-outline" size={19} color="#FFFFFF" />
+                <Text style={styles.routeBtnText}>Try Again</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {previewStatus === 'ready' && routeInfo && (
+            <>
+              <View style={styles.etaRow}>
+                <View style={styles.etaCard}>
+                  <Text style={styles.etaValue}>{formatDistance(routeInfo.distance)}</Text>
+                  <Text style={styles.etaLabel}>distance</Text>
+                </View>
+                <View style={styles.etaSep} />
+                <View style={styles.etaCard}>
+                  <Text style={styles.etaValue}>{formatDuration(routeInfo.duration)}</Text>
+                  <Text style={styles.etaLabel}>travel time</Text>
+                </View>
+              </View>
+              <TouchableOpacity style={styles.routeBtn} onPress={onStartRoute} activeOpacity={0.85}>
+                <AppIcon name="navigate" size={19} color="#FFFFFF" />
+                <Text style={styles.routeBtnText}>Start Navigation</Text>
               </TouchableOpacity>
             </>
           )}
@@ -171,10 +239,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center',
     gap: 8, marginBottom: 6,
   },
-  typeIcon:  { fontSize: 16 },
+  typeIcon:  {
+    width: 28, height: 28, borderRadius: 9,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: '#EFF6FF',
+  },
   title:     { flex: 1, fontSize: 15, fontWeight: '700', color: '#111827' },
-  closeIcon: { fontSize: 16, color: '#9CA3AF', paddingLeft: 8 },
   distance:  { fontSize: 13, color: '#6B7280', marginBottom: 10 },
+  distanceText: { fontSize: 13, color: '#6B7280' },
+  inlineStatus: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10,
+  },
   parkingBadge: {
     alignSelf: 'flex-start',
     borderRadius: 8, paddingVertical: 3, paddingHorizontal: 8,
@@ -182,24 +257,41 @@ const styles = StyleSheet.create({
   },
   parkingBadgeFree: { backgroundColor: '#DBEAFE' },
   parkingBadgePaid: { backgroundColor: '#FFEDD5' },
+  parkingBadgeUnknown: { backgroundColor: '#F1F5F9' },
   parkingBadgeText: { fontSize: 12, fontWeight: '700' },
   parkingBadgeTextFree: { color: '#1D4ED8' },
   parkingBadgeTextPaid: { color: '#C2410C' },
+  parkingBadgeTextUnknown: { color: '#475569' },
+  accessRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 7,
+    marginTop: -2, marginBottom: 7,
+  },
+  accessDot: {
+    width: 8, height: 8, borderRadius: 4,
+    backgroundColor: '#007AFF',
+  },
+  accessText: { flex: 1, fontSize: 12, fontWeight: '600', color: '#475569' },
   locationHint: {
-    fontSize: 13, color: '#92400E', marginBottom: 10,
+    flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 10,
     backgroundColor: '#FEF3C7', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10,
   },
-  routeBtn:  { borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginBottom: 8 },
+  locationHintText: { flex: 1, fontSize: 13, color: '#92400E' },
+  routeBtn:  {
+    backgroundColor: ACCENT,
+    borderRadius: 14, paddingVertical: 13, alignItems: 'center', justifyContent: 'center',
+    flexDirection: 'row', gap: 8, marginBottom: 8,
+  },
   routeBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
   gmapsBtn: {
     borderRadius: 14, paddingVertical: 11,
     alignItems: 'center', borderWidth: 1.5, borderColor: '#34A853',
   },
   gmapsBtnText: { color: '#34A853', fontSize: 14, fontWeight: '600' },
-  errorText: {
-    fontSize: 13, color: '#92400E', textAlign: 'center',
+  errorBox: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7,
     backgroundColor: '#FEF9C3', borderRadius: 8, padding: 8, marginBottom: 10,
   },
+  errorText: { flexShrink: 1, fontSize: 13, color: '#92400E', textAlign: 'center' },
   etaRow: {
     flexDirection: 'row', justifyContent: 'center',
     alignItems: 'center', marginBottom: 10, marginTop: 2,
@@ -208,7 +300,15 @@ const styles = StyleSheet.create({
   etaSep:       { width: 1, height: 38, backgroundColor: '#E5E7EB' },
   etaValue:     { fontSize: 21, fontWeight: '800', color: '#111827' },
   etaLabel:     { fontSize: 11, color: '#9CA3AF', marginTop: 2 },
-  calculating:  { fontSize: 14, color: '#9CA3AF', textAlign: 'center', marginVertical: 10 },
-  cancelBtn:    { backgroundColor: '#FEE2E2', borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginBottom: 8 },
+  calculating:  {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7,
+    marginVertical: 10,
+  },
+  calculatingText: { fontSize: 14, color: '#64748B' },
+  cancelBtn:    {
+    backgroundColor: '#FEE2E2', borderRadius: 14, paddingVertical: 13,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7,
+    marginBottom: 8,
+  },
   cancelBtnText:{ color: '#DC2626', fontSize: 15, fontWeight: '700' },
 });

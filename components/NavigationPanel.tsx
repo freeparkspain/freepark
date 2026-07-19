@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'rea
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { NavigationState } from '../types/navigation';
 import { formatDistanceEn, formatDurationEn } from '../navigation/format';
+import { AppIcon, AppIconName } from './AppIcon';
 
 interface Props {
   state:        NavigationState;
@@ -12,20 +13,26 @@ interface Props {
   onRetry?:     () => void;
 }
 
-// Unicode maneuver glyph — a compact, dependency-free arrow for the top banner.
-function maneuverIcon(type: string, modifier: string | null): string {
-  if (type === 'arrive') return '🏁';
-  if (type === 'depart') return '➤';
-  if (type === 'roundabout' || type === 'rotary' || type === 'roundabout turn') return '⟳';
+interface ManeuverIcon {
+  name: AppIconName;
+  rotation?: '-45deg' | '45deg';
+}
+
+function maneuverIcon(type: string, modifier: string | null): ManeuverIcon {
+  if (type === 'arrive') return { name: 'flag' };
+  if (type === 'depart') return { name: 'navigate' };
+  if (type === 'roundabout' || type === 'rotary' || type === 'roundabout turn') {
+    return { name: 'sync' };
+  }
   switch (modifier) {
-    case 'left':         return '⬅';
-    case 'right':        return '➡';
-    case 'slight left':  return '↖';
-    case 'slight right': return '↗';
-    case 'sharp left':   return '⬅';
-    case 'sharp right':  return '➡';
-    case 'uturn':        return '⤺';
-    default:             return '⬆';
+    case 'left':         return { name: 'arrow-back' };
+    case 'right':        return { name: 'arrow-forward' };
+    case 'slight left':  return { name: 'arrow-up', rotation: '-45deg' };
+    case 'slight right': return { name: 'arrow-up', rotation: '45deg' };
+    case 'sharp left':   return { name: 'return-up-back' };
+    case 'sharp right':  return { name: 'return-up-forward' };
+    case 'uturn':        return { name: 'return-up-back' };
+    default:             return { name: 'arrow-up' };
   }
 }
 
@@ -70,7 +77,10 @@ export const NavigationPanel: React.FC<Props> = ({
     return (
       <View style={styles.centerWrap} pointerEvents="box-none">
         <View style={[styles.statusCard, styles.errorCard]}>
-          <Text style={styles.errorText}>⚠️ {state.message}</Text>
+          <View style={styles.errorMessageRow}>
+            <AppIcon name="alert-circle" size={22} color="#DC2626" />
+            <Text style={styles.errorText}>{state.message}</Text>
+          </View>
           <View style={styles.errorActions}>
             {state.recoverable && onRetry && (
               <TouchableOpacity style={styles.retryBtn} onPress={onRetry}>
@@ -90,7 +100,10 @@ export const NavigationPanel: React.FC<Props> = ({
     return (
       <View style={styles.centerWrap} pointerEvents="box-none">
         <View style={styles.statusCard}>
-          <Text style={styles.arrivedText}>🏁 You have arrived</Text>
+          <View style={styles.arrivedRow}>
+            <AppIcon name="flag" size={24} color="#0A67D8" />
+            <Text style={styles.arrivedText}>You have arrived</Text>
+          </View>
           <TouchableOpacity style={styles.closeBtn} onPress={onStop}>
             <Text style={styles.closeText}>Done</Text>
           </TouchableOpacity>
@@ -100,13 +113,24 @@ export const NavigationPanel: React.FC<Props> = ({
   }
 
   // ── Active navigation ────────────────────────────────────────────────────────
+  const maneuver = maneuverIcon(state.maneuverType, state.maneuverModifier);
+
   return (
     <>
       {/* Top maneuver banner — compact, anchored to the top safe area so it
           reads at a glance without covering much of the map (BUG 7). */}
       <View style={[styles.topBanner, { top: topOffset }]} pointerEvents="box-none">
         <View style={styles.bannerRow}>
-          <Text style={styles.icon}>{maneuverIcon(state.maneuverType, state.maneuverModifier)}</Text>
+          <View style={styles.icon}>
+            <AppIcon
+              name={maneuver.name}
+              size={38}
+              color="#FFFFFF"
+              style={maneuver.rotation
+                ? { transform: [{ rotate: maneuver.rotation }] }
+                : undefined}
+            />
+          </View>
           <View style={styles.bannerTextCol}>
             <Text style={styles.distanceToTurn}>
               {formatDistanceEn(state.distanceToNextManeuverMeters)}
@@ -159,7 +183,11 @@ export const NavigationPanel: React.FC<Props> = ({
             hitSlop={hit}
             accessibilityLabel="Recenter map on your location"
           >
-            <Text style={styles.ctrlIcon}>🧭</Text>
+            <AppIcon
+              name="locate"
+              size={22}
+              color={state.isFollowingUser ? '#64748B' : '#0A67D8'}
+            />
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.ctrlBtn}
@@ -167,7 +195,11 @@ export const NavigationPanel: React.FC<Props> = ({
             hitSlop={hit}
             accessibilityLabel={state.isMuted ? 'Unmute voice guidance' : 'Mute voice guidance'}
           >
-            <Text style={styles.ctrlIcon}>{state.isMuted ? '🔇' : '🔊'}</Text>
+            <AppIcon
+              name={state.isMuted ? 'volume-mute' : 'volume-high'}
+              size={22}
+              color={state.isMuted ? '#64748B' : '#0A67D8'}
+            />
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.endBtn}
@@ -203,7 +235,7 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   bannerRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  icon: { fontSize: 34, color: '#fff', width: 40, textAlign: 'center' },
+  icon: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
   bannerTextCol: { flex: 1 },
   distanceToTurn: { color: '#fff', fontSize: 22, fontWeight: '800' },
   instruction: { color: '#fff', fontSize: 15, fontWeight: '600', marginTop: 1 },
@@ -248,7 +280,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#F3F4F6', alignItems: 'center', justifyContent: 'center',
   },
   ctrlBtnActive: { backgroundColor: '#DBEAFE' },
-  ctrlIcon: { fontSize: 20 },
   endBtn: {
     backgroundColor: '#FEE2E2', borderRadius: 22,
     paddingHorizontal: 16, height: 44, alignItems: 'center', justifyContent: 'center',
@@ -268,11 +299,13 @@ const styles = StyleSheet.create({
   statusText: { fontSize: 15, fontWeight: '600', color: '#111827' },
   statusCancel: { fontSize: 14, color: '#6B7280', marginTop: 4 },
   errorCard: { borderWidth: 1, borderColor: '#FCA5A5' },
-  errorText: { fontSize: 14, color: '#991B1B', textAlign: 'center', fontWeight: '600' },
+  errorMessageRow: { flexDirection: 'row', alignItems: 'center', gap: 8, maxWidth: 300 },
+  errorText: { flexShrink: 1, fontSize: 14, color: '#991B1B', textAlign: 'center', fontWeight: '600' },
   errorActions: { flexDirection: 'row', gap: 10, marginTop: 4 },
   retryBtn: { backgroundColor: '#007AFF', borderRadius: 12, paddingHorizontal: 16, paddingVertical: 10 },
   retryText: { color: '#fff', fontWeight: '700' },
   closeBtn: { backgroundColor: '#F3F4F6', borderRadius: 12, paddingHorizontal: 16, paddingVertical: 10 },
   closeText: { color: '#374151', fontWeight: '700' },
-  arrivedText: { fontSize: 18, fontWeight: '800', color: '#059669' },
+  arrivedRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  arrivedText: { fontSize: 18, fontWeight: '800', color: '#0A67D8' },
 });

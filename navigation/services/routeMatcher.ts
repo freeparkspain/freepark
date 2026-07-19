@@ -79,8 +79,23 @@ export function matchToRoute(
     };
   }
 
-  const startSeg = prev ? Math.max(0, prev.segmentIndex - config.searchSegmentsBehind) : 0;
-  const endSeg   = prev ? Math.min(lastSeg, prev.segmentIndex + config.searchSegmentsAhead) : lastSeg;
+  const routeLength = cumulative[cumulative.length - 1];
+  const usablePrev = prev &&
+    Number.isInteger(prev.segmentIndex) &&
+    prev.segmentIndex >= 0 &&
+    prev.segmentIndex <= lastSeg &&
+    Number.isFinite(prev.progressMeters) &&
+    prev.progressMeters >= 0 &&
+    prev.progressMeters <= routeLength
+      ? prev
+      : null;
+
+  const startSeg = usablePrev
+    ? Math.max(0, usablePrev.segmentIndex - config.searchSegmentsBehind)
+    : 0;
+  const endSeg = usablePrev
+    ? Math.min(lastSeg, usablePrev.segmentIndex + config.searchSegmentsAhead)
+    : lastSeg;
 
   let bestI = startSeg;
   let bestT = 0;
@@ -104,9 +119,12 @@ export function matchToRoute(
 
   // Guard against a big backward jump — hold at the previous progress instead
   // of snapping to an earlier, parallel part of the route.
-  if (prev && progress < prev.progressMeters - config.maximumBackwardProgressMeters) {
-    const held = positionAtDistance(index, prev.progressMeters);
-    progress = prev.progressMeters;
+  if (
+    usablePrev &&
+    progress < usablePrev.progressMeters - config.maximumBackwardProgressMeters
+  ) {
+    const held = positionAtDistance(index, usablePrev.progressMeters);
+    progress = usablePrev.progressMeters;
     segIndex = held.segmentIndex;
     matchedSnap = held.position;
     dist = haversineDistance(raw, held.position);

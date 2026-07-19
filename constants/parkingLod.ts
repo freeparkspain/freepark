@@ -4,13 +4,41 @@
 // large area and progressively reveal geometry as they zoom in:
 //
 //   low    — markers/clusters only, NO zone geometry (large visible area)
-//   medium — markers + SIMPLIFIED, solid zone outlines
-//   high   — markers + FULL zone outlines (existing detailed behaviour)
+//   medium — SIMPLIFIED zone outlines only (no markers/clusters)
+//   high   — FULL zone outlines only (no markers/clusters)
 //
 // Thresholds live here (not scattered across components) so the map, the
 // geometry-fetch effect and the rendering layer all agree on one definition.
 
 export type ParkingLod = 'low' | 'medium' | 'high';
+
+/**
+ * Explicit rendering contract for every LOD. Keeping this pure and centralised
+ * prevents markers and zone geometry from accidentally being mounted together.
+ */
+export interface ParkingLodPresentation {
+  showMarkers: boolean;
+  showZones: boolean;
+  simplifyZones: boolean;
+}
+
+export const PARKING_LOD_PRESENTATION: Record<ParkingLod, ParkingLodPresentation> = {
+  low: {
+    showMarkers: true,
+    showZones: false,
+    simplifyZones: false,
+  },
+  medium: {
+    showMarkers: false,
+    showZones: true,
+    simplifyZones: true,
+  },
+  high: {
+    showMarkers: false,
+    showZones: true,
+    simplifyZones: false,
+  },
+};
 
 // Approximate Web-Mercator zoom from a MapView latitudeDelta. Fractional (unlike
 // utils/geo.deltaToZoom, which rounds) so the hysteresis band below is smooth.

@@ -20,9 +20,13 @@ export const ROUTING_CONFIG: RoutingConfig = {
 // ─── Navigation tuning ────────────────────────────────────────────────────────
 
 export const NAVIGATION_CONFIG: NavigationConfig = {
-  offRouteThresholdMeters:        50,
-  offRouteConfirmationsRequired:  3,
-  rerouteCooldownMillis:          10_000,
+  // Tightened from 50 m / 3 confirmations / 10 s cooldown — a driver who
+  // misses a turn was staying "guided" on the old route for several seconds
+  // after clearly diverging. Still requires 2 consecutive samples (not a
+  // single GPS blip) before recalculating, just fewer of them.
+  offRouteThresholdMeters:        40,
+  offRouteConfirmationsRequired:  2,
+  rerouteCooldownMillis:          6_000,
   destinationArrivalRadiusMeters: 25,
   maxUsableAccuracyMeters:        40,
 };
@@ -58,10 +62,10 @@ export const CAR_TRACKING_CONFIG: CarTrackingConfig = {
 export const NAVIGATION_CAMERA_CONFIG: NavigationCameraConfig = {
   // Comfortable base driving zoom for city speed; drivingZoom() zooms out
   // further as speed rises so more road ahead is visible.
-  zoom:                        16.5,
-  // Flat 2D navigation (no 3D tilt) — reads like a professional 2D map. The map
-  // still rotates to the travel heading; only the pitch is removed.
-  pitch:                       0,
+  zoom:                        17.2,
+  // Heading-up perspective leaves more road visible ahead, matching familiar
+  // driving navigation while keeping labels and the route easy to read.
+  pitch:                       45,
   carVerticalPositionRatio:    0.7,
   animationDurationMs:         500,
   minimumPositionUpdateMeters: 2,
